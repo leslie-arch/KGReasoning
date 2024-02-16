@@ -1,15 +1,18 @@
 #!/home/leslie/julia/1.10.0/bin/julia
 
-module KGModule
+module KGModel
 
+using Zygote: AbstractFFTs
 export Identity, normDims, BoxOffsetIntersection, CenterIntersection, BetaIntersection,
-        BetaProjection, Regularizer, KGReasoning
+    BetaProjection, Regularizer, KGReasoning, train_step
 
 using Flux;
 using Zygote;
 using Statistics;
 using Distributions;
 using MLUtils;
+
+include("utils.jl")
 
 function Identity(x)
     return x;
@@ -55,19 +58,19 @@ struct CenterIntersection
 end
 
 function CenterIntersection(dim::Int)
-        layer1 = Flux.Dense(dim => dim)
-        layer2 = Flux.Dense(dim => dim)
+    layer1 = Flux.Dense(dim => dim)
+    layer2 = Flux.Dense(dim => dim)
 
-        #Flux.Dense is initialized by  xavier defaultly
-        return CenterIntersection(dim, layer1, layer2)
+    #Flux.Dense is initialized by  xavier defaultly
+    return CenterIntersection(dim, layer1, layer2)
 end
 
 function (m::CenterIntersection)(embeddings)
-        layer1_act = Flux.relu(m.layer1(embeddings)) # ( dim, num_conj)
-        attention = Flux.softmax(m.layer2(layer1_act), dims=length(size(layer1_act))) # (dim, num_conj, )
-        embedding = sum(attention * embeddings, dims=length(size(layer1_act)))
+    layer1_act = Flux.relu(m.layer1(embeddings)) # ( dim, num_conj)
+    attention = Flux.softmax(m.layer2(layer1_act), dims=length(size(layer1_act))) # (dim, num_conj, )
+    embedding = sum(attention * embeddings, dims=length(size(layer1_act)))
 
-        return embedding
+    return embedding
 end
 
 Flux.@functor CenterIntersection
@@ -85,12 +88,10 @@ function BetaIntersection(dim::Int)
     return BetaIntersection(dim, layer1, layer2)
 end
 
-Flux.@functor BetaIntersection
-
 function (m::BetaIntersection)(alpha_embeddings, beta_embeddings)
     all_embeddings = cat(length(size(alpha_embeddings)), alpha_embeddings, beta_embeddings)
-    layer1_act = Flux.relu(layer1(all_embeddings)) # (num_conj, batch_size, 2 * dim)
-    attention = Flux.softmax(layer2(layer1_act), dims=length(size(alpha_embeddings))) # (num_conj, batch_size, dim)
+    layer1_act = Flux.relu(m.layer1(all_embeddings)) # (num_conj, batch_size, 2 * dim)
+    attention = Flux.softmax(m.layer2(layer1_act), dims=length(size(alpha_embeddings))) # (num_conj, batch_size, dim)
 
     alpha_embedding = sum(attention * alpha_embeddings, dims=length(size(alpha_embeddings)))
     beta_embedding = sum(attention * beta_embeddings, dims=length(size(alpha_embeddings)))
@@ -100,37 +101,62 @@ end
 
 Flux.@functor BetaIntersection
 
+struct Regularizer
+    base_add::AbstractFloat
+    min_val::AbstractFloat
+    max_val::AbstractFloat
+end
+
+function (m::Regularizer)(entity_embedding)
+    return clamp(entity_embedding + m.base_add, m.min_val, m.max_val)
+end
+
+Flux.@functor Regularizer
+
 struct BetaProjection
     entity_dim::Int
     relation_dim::Int
     hidden_dim::Int
     num_layers::Int
-    layer1::Flux.Dense
-    layer0::Flux.Dense
-    hidden_layers::Dict{String, Flux.Dense}
+
+    layers::Dict{Symbol, Flux.Dense}
     projection_regularizer
 end
 
-function BetaProjection(entity_dim, relation_dim, hidden_dim, projection_regularizer, num_layers)
-    layer1 = Flux.Dense(entity_dim + relation_dim, hidden_dim) # 1st layer
-    layer0 = Flux.Dense(hidden_dim, entity_dim) # final layer
+function Base.setproperty!(m::BetaProjection, property::Symbol, value)
+    getfield(m, :layers)[property] = value
+end
 
-    hidden_layers = Dict{String, Flux.Dense}()
-    for nl in range(2, num_layers + 1)
-        hidden_layers("layer$nl".format(nl), Flux.Dense(hidden_dim, hidden_dim))
+function Base.getproperty(m::BetaProjection, property::Symbol, value)
+    return getfield(m, :layers)[property]
+end
+
+function Base.propertynames(m::BetaProjection, private = false)
+    return keys(getproperty(m, :layers))
+end
+
+function BetaProjection(entity_dim, relation_dim, hidden_dim, projection_regularizer, num_layers)
+    layer1 = Flux.Dense((entity_dim + relation_dim) => hidden_dim) # 1st layer
+    layer0 = Flux.Dense(hidden_dim => entity_dim) # final layer
+
+    layers = Dict{Symbol, Flux.Dense}()
+    layers[:layer1] = Flux.Dense((entity_dim + relation_dim) => hidden_dim) # 1st layer
+    layers[:layer0]  = Flux.Dense(hidden_dim => entity_dim) # final layer
+    for nl in range(2, num_layers)
+        layers[Symbol("layer$(nl)")] = Flux.Dense(hidden_dim, hidden_dim)
     end
 
     return BetaProjection(entity_dim, relation_dim, hidden_dim, num_layers,
-                layer1, layer0, hidden_layers, projection_regularizer)
+                          layers, projection_regularizer)
 
 end
 
 function (m::BetaProjection)(e_embedding, r_embedding)
     x = cat(1, e_embedding, r_embedding)
-    for nl in range(1, m.num_layers + 1)
-        x = Flux.relu(getattr(self, "layer{}".format(nl))(x))
+    for nl in range(1, m.num_layers)
+        x = Flux.relu(getproperty(m, Symbol("layer$(nl)")(x)))
     end
-    x = m.layer0(x)
+    x = getproperty(m, :layer0)(x)
     x = m.projection_regularizer(x)
 
     return x
@@ -138,23 +164,11 @@ end
 
 Flux.@functor BetaProjection
 
-struct Regularizer
-    base_add::Int
-    min_val::Int
-    max_val::Int
-end
-
-function (m::Regularizer)(entity_embedding)
-    return clamp(entity_embedding + self.base_add, self.min_val, self.max_val)
-end
-
-Flux.@functor Regularizer
-
 struct KGReasoning
     nentity::Int
     nrelation::Int
     hidden_dim::Int
-    epsilon::Float16
+    epsilon::AbstractFloat
     geo::String
     use_cuda::Bool
     batch_entity_range #TODO type and initialize
@@ -181,22 +195,12 @@ struct KGReasoning
     projection_net
 end
 
-function KGReasoning(nentity,
-                    nrelation,
-                    hidden_dim,
-                    gamma,
-                    geo,
-                    test_batch_size=1,
-                    box_mode=nothing,
-                    beta_mode=nothing,
-                    query_name_dict=nothing,
-                    use_cuda=False)
-    nentity = nentity
-    nrelation = nrelation
-    hidden_dim = hidden_dim
+Flux.@functor KGReasoning
+
+function KGReasoning(nentity, nrelation, hidden_dim, gamma, geo, test_batch_size=1,
+                     box_mode=nothing, beta_mode=nothing, query_name_dict=nothing, use_cuda=false)
     epsilon = 2.0
-    sgeo = geo
-    use_cuda = use_cuda
+
     batch_entity_range = repeat(convert.(Float32, range(0, nentity - 1)), 1, test_batch_size)
 
     gamma = Zygote.Params([gamma])
@@ -255,7 +259,8 @@ function KGReasoning(nentity,
     elseif geo == "vec"
         center_net = CenterIntersection(entity_dim)
     elseif geo == "beta"
-        hidden_dim, num_layers = beta_mode
+        hidden_dim, num_layers = eval_tuple(beta_mode)
+
         center_net = BetaIntersection(entity_dim)
         projection_net = BetaProjection(entity_dim * 2,
                                         relation_dim,
@@ -290,12 +295,13 @@ function embed_query_box(m::KGReasoning, queries, query_structure, idx)
     all_relation_flag = true
      # whether the current query tree has mfferged to one branch and only need to do relation traversal,
      # e.g., path queries or conjunctive queries after the intersection
-    for ele in last(query_structure)
-        if ele not in ["r", "n"]
+    for r in last(query_structure)
+        if !(r in ["r", "n"])
             all_relation_flag = false
             break
         end
     end
+
     if all_relation_flag
         if query_structure[0] == "e"
             embedding = m.entity_embedding[:, queries[:, idx]]
@@ -343,7 +349,9 @@ queries: a flattened batch of queries
 function embed_query_vec(m::KGReasoning, queries, query_structure, idx)
 
     all_relation_flag = true
-    for ele in last(query_structure) # whether the current query tree has merged to one branch and only need to do relation traversal, e.g., path queries or conjunctive queries after the intersection
+    # whether the current query tree has merged to one branch and only need to do relation traversal,
+    # e.g., path queries or conjunctive queries after the intersection
+    for ele in last(query_structure)
         if !(ele in ["r", "n"])
             all_relation_flag = false
             break
@@ -385,8 +393,10 @@ queries: a flattened batch of queries
 =#
 function embed_query_beta(m::KGReasoning, queries, query_structure, idx)
 
-    all_relation_flag = True
-    for ele in last(query_structure) # whether the current query tree has merged to one branch and only need to do relation traversal, e.g., path queries or conjunctive queries after the intersection
+    all_relation_flag = true
+    # whether the current query tree has merged to one branch and only need to do relation traversal,
+    # e.g., path queries or conjunctive queries after the intersection
+    for ele in last(query_structure)
         if !(ele in ["r", "n"])
             all_relation_flag = false
             break
@@ -600,7 +610,7 @@ function forward_box(m::KGReasoning, positive_sample, negative_sample, subsampli
     all_center_embeddings, all_offset_embeddings, all_idxs = [], [], []
     all_union_center_embeddings, all_union_offset_embeddings, all_union_idxs = [], [], []
     for query_structure in batch_queries_dict
-        if "u" in self.query_name_dict[query_structure]
+        if "u" in m.query_name_dict[query_structure]
             center_embedding, offset_embedding, _ = \
                 embed_query_box(m, m.transform_union_query(batch_queries_dict[query_structure],
                                                                 query_structure),
@@ -731,7 +741,7 @@ function forward_vec(m::KGReasoning, positive_sample, negative_sample, subsampli
     all_center_embeddings, all_idxs = [], []
     all_union_center_embeddings, all_union_idxs = [], []
     for query_structure in batch_queries_dict
-        if "u" in self.query_name_dict[query_structure]
+        if "u" in m.query_name_dict[query_structure]
             center_embedding, _ = embed_query_vec(m, transform_union_query(m, batch_queries_dict[query_structure],
                                                                            query_structure),
                                                   transform_union_structure(query_structure), 0)
@@ -839,25 +849,22 @@ function mean_loss(y_bar)
     loss = (positive_sample_loss + negative_sample_loss)/2
 end
 ===============================================================================#
-# @staticmethod
-function train_step(model, optimizer, train_iterator, args, step)
-    opti_stat = Flux.setup(model, optimizer)
 
-    opti_stat = Flux.train!(model, )
-
+function loss(model, data)
     ########################################################################################################
     #model.train() # set model as train mode
     #optimizer.zero_grad() # clear grad, set to zero
+    positive_sample, negative_sample, subsampling_weight, querie, query_structures = data
 
-    positive_sample, negative_sample, subsampling_weight, batch_queries, query_structures = next(train_iterator)
     #batch_queries_dict = collections.defaultdict(list)
     #batch_idxs_dict = collections.defaultdict(list)
     batch_queries_dict = Dict{Any, Any}()
     batch_idxs_dict = Dict{Any, Any}()
-    for (i, query) in enumerate(batch_queries) # group queries with same structure
+    for (i, query) in enumerate(querie) # group queries with same structure
         push!(get!(batch_queries_dict, query_structures[i], []), query)
         push!(get!(batch_idxs_dict, query_structures[i], []), i)
     end
+
     for query_structure in batch_queries_dict
         if args["cuda"]
             batch_queries_dict[query_structure] = Int64.(batch_queries_dict[query_structure]) .|> gpu
@@ -865,6 +872,7 @@ function train_step(model, optimizer, train_iterator, args, step)
             batch_queries_dict[query_structure] = Int64.(batch_queries_dict[query_structure])
         end
     end
+
     if args["cuda"]
         positive_sample = positive_sample |> gpu
         negative_sample = negative_sample |> gpu
@@ -872,19 +880,78 @@ function train_step(model, optimizer, train_iterator, args, step)
     end
 
     opt_grads = Flux.gradient(model) do m
-                       positive_logit, negative_logit, subsampling_weight, _ = model(positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
-                       negative_logsigmoid = Flux.logsigmoid(negative_logit)
-                       negative_score = mean.(negative_logsigmoid, dims=ndims(negative_logsigmoid))
-                       positive_logsigmoid =Flux.logsigmoid(positive_logit)
-                       positive_score = squeeze(positive_logsigmoid, dim=ndims(positive_logsigmoid))
-                       positive_sample_loss = - sum(subsampling_weight * positive_score)
-                       negative_sample_loss = - sum(subsampling_weight * negative_score)
-                       positive_sample_loss /= sum(subsampling_weight)
-                       negative_sample_loss /= sum(subsampling_weight)
+        positive_logit, negative_logit,
+        subsampling_weight, _ = model(positive_sample, negative_sample,
+                                      subsampling_weight, batch_queries_dict, batch_idxs_dict)
+        negative_logsigmoid = Flux.logsigmoid(negative_logit)
+        negative_score = mean.(negative_logsigmoid, dims=ndims(negative_logsigmoid))
+        positive_logsigmoid =Flux.logsigmoid(positive_logit)
+        positive_score = squeeze(positive_logsigmoid, dim=ndims(positive_logsigmoid))
+        positive_sample_loss = - sum(subsampling_weight * positive_score)
+        negative_sample_loss = - sum(subsampling_weight * negative_score)
+        positive_sample_loss /= sum(subsampling_weight)
+        negative_sample_loss /= sum(subsampling_weight)
 
-                       loss = (positive_sample_loss + negative_sample_loss)/2
-                end
-#=========================================================================
+        loss = (positive_sample_loss + negative_sample_loss)/2
+    end
+    return 0
+end
+
+# @staticmethod
+function train_step(model::KGReasoning, opt_state, data, args, step)
+    #opti_stat = Flux.setup(model, optimizer)
+
+    #println("train_step data :: $(data)")
+    positive_sample, negative_sample, subsampling_weight, querie, query_structures = data
+    println("train_data: $(positive_sample), $(negative_sample), $(subsampling_weight), $(querie), $(query_structures)")
+
+    #Flux.train!(loss, model, data, opt_state)# do model, data
+
+    ########################################################################################################
+    #model.train() # set model as train mode
+    #optimizer.zero_grad() # clear grad, set to zero
+    positive_sample, negative_sample, subsampling_weight, querie, query_structures = data
+
+    #batch_queries_dict = collections.defaultdict(list)
+    #batch_idxs_dict = collections.defaultdict(list)
+    batch_queries_dict = Dict{Any, Any}()
+    batch_idxs_dict = Dict{Any, Any}()
+    for (i, query) in enumerate(querie) # group queries with same structure
+        push!(get!(batch_queries_dict, query_structures[i], []), query)
+        push!(get!(batch_idxs_dict, query_structures[i], []), i)
+    end
+
+    for query_structure in batch_queries_dict
+        if args["cuda"]
+            batch_queries_dict[query_structure] = Int64.(batch_queries_dict[query_structure]) .|> gpu
+        else
+            batch_queries_dict[query_structure] = Int64.(batch_queries_dict[query_structure])
+        end
+    end
+
+    if args["cuda"]
+        positive_sample = positive_sample |> gpu
+        negative_sample = negative_sample |> gpu
+        subsampling_weight = subsampling_weight |> gpu
+    end
+
+    opt_grads = Flux.gradient(model) do m
+        positive_logit, negative_logit,
+        subsampling_weight, _ = model(positive_sample, negative_sample,
+                                      subsampling_weight, batch_queries_dict, batch_idxs_dict)
+        negative_logsigmoid = Flux.logsigmoid(negative_logit)
+        negative_score = mean.(negative_logsigmoid, dims=ndims(negative_logsigmoid))
+        positive_logsigmoid =Flux.logsigmoid(positive_logit)
+        positive_score = squeeze(positive_logsigmoid, dim=ndims(positive_logsigmoid))
+        positive_sample_loss = - sum(subsampling_weight * positive_score)
+        negative_sample_loss = - sum(subsampling_weight * negative_score)
+        positive_sample_loss /= sum(subsampling_weight)
+        negative_sample_loss /= sum(subsampling_weight)
+
+        loss = (positive_sample_loss + negative_sample_loss)/2
+    end
+    #end
+    #=========================================================================
     negative_score = F.logsigmoid(-negative_logit).mean(dim=1)
     positive_score = F.logsigmoid(positive_logit).squeeze(dim=1)
     positive_sample_loss = - (subsampling_weight * positive_score).sum()
@@ -895,7 +962,7 @@ function train_step(model, optimizer, train_iterator, args, step)
     loss = (positive_sample_loss + negative_sample_loss)/2
     loss.backward()
     optimizer.step()
-==========================================================================#
+    ==========================================================================#
     log = Dict{
         "positive_sample_loss": positive_sample_loss.item(),
         "negative_sample_loss": negative_sample_loss.item(),

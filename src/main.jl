@@ -1,18 +1,20 @@
 #!/home/leslie/julia/1.10.0/bin/julia
 
-using MLUtils;
+using MLUtils
 using Random
 using ArgParse
-using Logging, LoggingExtras, TensorBoardLogger
+using LoggingExtras, TensorBoardLogger
 using Dates
-using Flux
+using Flux, JLD2
 
-
-print("working directory: {$(pwd())}")
+#println("working directory: {$(pwd())}")
 
 include("dataloader.jl")
 include("model.jl")
 include("utils.jl")
+
+using .KGDataset
+using .KGModel
 
 f_dir = "dataset";
 f_model = "FB15k-betae";
@@ -40,7 +42,7 @@ all_tasks = collect(keys(name_query_dict));
 function parse_cmdargs(args::Vector{String})
     s = ArgParseSettings(
         description = "Training and Testing Knowledge Graph Embedding Models",
-        usage = "train.py [<args>] [-h | --help]"
+        usage = "julia --project=[/path/to/project] src/$(@__FILE__) [<args>] [-h | --help]"
     )
 
     @add_arg_table s begin
@@ -80,7 +82,7 @@ function parse_cmdargs(args::Vector{String})
         default=1
         arg_type=Int
         help="valid/test batch size"
-        "--lr"
+        "--learning_rate"
         default=0.0001
         arg_type=Float64
         "--cpu"
@@ -235,9 +237,10 @@ function evaluate(model, tp_answers, fn_answers, args, dataloader, query_name_di
     return all_metrics
 end
 
-function main(args)
-    global train_queries, train_answers, valid_queries, valid_hard_answers, valid_easy_answers, test_queries, test_hard_answers, test_easy_answers
-
+function main(cmd_args)
+    #global train_queries, train_answers, valid_queries, valid_hard_answers, valid_easy_answers, test_queries, test_hard_answers, test_easy_answers
+    args = parse_cmdargs(cmd_args)
+    set_logger(args);
     Random.seed!(args["seed"])
     tasks = split(args["tasks"], ".")
     for task in tasks
@@ -305,19 +308,36 @@ function main(args)
     @info("Evaluate unoins using: $(args["evaluate_union"])")
 
     train_queries, train_answers, valid_queries, valid_hard_answers, valid_easy_answers,
-    test_queries, test_hard_answers, test_easy_answers = KGDataset.load_data(args, tasks, all_tasks, name_query_dict)
-
-    if args["train"]
-        @info("Training ...")
-        #=
-        for query_structure in keys(train_queries)
-        @info (query_name_dict[query_structure] * ": " * "$(length(train_queries[query_structure]))")
+    test_queries, test_hard_answers, test_easy_answers = KGDataset.load_data(args, name_query_dict)
+    #=---------- for  test
+    flatten_queries = flatten_query(train_queries)
+    t = length(flatten_queries)
+    println(" flatten_queries length: $(t)")
+    train_dataset = KGDataset.TrainDataset(flatten_queries, train_answers, t, t, 32)
+    train_data_loader = MLUtils.DataLoader(train_dataset, batchsize = 4, collate = true, shuffle = false);
+    #for x in data_loader
+    #    @info "data_loader loop...." * "$(size(x))"
+    #end
+    idx = 1
+    for d in train_data_loader
+        println(d)
+        println("-----------------")
+        idx += 1
+        if idx > 9
+            break
         end
-        =#
+    end
+    println("exit after iterator.....")
+    =#
+
+    local train_path_iterator, train_other_iterator
+    if args["train"]
+        @info("Train required...")
         train_path_queries = Dict{Any, Set}()
         train_other_queries = Dict{Any, Set}()
         query_path_list = ["1p", "2p", "3p"]
         for query_structure in keys(train_queries)
+            print(query_structure)
             if query_name_dict[query_structure] in query_path_list
                 train_path_queries[query_structure] = train_queries[query_structure]
             else
@@ -328,34 +348,29 @@ function main(args)
         train_path_queries = flatten_query(train_path_queries)
         @info "Flatten query length: $(length(train_path_queries)) typeof(query) $(typeof(train_path_queries))"
 
-        train_dataset = KGDataset.TrainDataset(train_path_queries, train_answers, nentity, nrelation, args["negative_sample_size"])
-        data_loader = MLUtils.DataLoader(train_dataset, batchsize = args["batch_size"], collate = true, shuffle = false);
+        train_path_dataset = KGDataset.TrainDataset(train_path_queries, train_answers, nentity, nrelation, args["negative_sample_size"])
+        train_path_data_loader = MLUtils.DataLoader(train_path_dataset, batchsize = args["batch_size"], shuffle = false);
         #for x in data_loader
         #    @info "data_loader loop...." * "$(size(x))"
         #end
-        train_qpath_iterator = KGDataset.SingleDirectionalOneShotIterator(data_loader);
+        train_path_iterator = KGDataset.SingleDirectionalOneShotIterator(train_path_data_loader);
         #            num_workers=args.cpu_num,
         #            collate_fn=TrainDataset.collate_fn));
 
         if length(train_other_queries) > 0
             train_other_queries = flatten_query(train_other_queries)
-            train_other_iterator = KGDataset.SingleDirectionalOneShotIterator(
-                MLUtils.DataLoader(KGDataset.TrainDataset(train_other_queries,
-                                                          train_answers,
-                                                          nentity,
-                                                          nrelation,
-                                                          args["negative_sample_size"]),
-                                   batchsize=args["batch_size"],
-                                   shuffle=true));
-            #                                       num_workers=args.cpu_num,
-            #                                       collate_fn=TrainDataset.collate_fn))
+            train_other_dataset = KGDataset.TrainDataset(train_other_queries, train_answers, nentity, nrelation, args["negative_sample_size"])
+            train_other_dataloader = MLUtils.DataLoader(train_other_dataset, batchsize=args["batch_size"], shuffle=true)
+            train_other_iterator = KGDataset.SingleDirectionalOneShotIterator(train_other_dataloader)
+            #_workers=args.cpu_num,
+            #collate_fn=TrainDataset.collate_fn))
         else
-            train_other_iterator = None
+            train_other_iterator = nothing
         end
     end
 
     if args["valid"]
-        @info("Validation ...")
+        @info("Validation required...")
 
         #for query_structure in keys(valid_queries)
         #    @info query_name_dict[query_structure] * ": " * "$(length(valid_queries[query_structure]))"
@@ -368,7 +383,7 @@ function main(args)
     end
 
     if args["test"]
-        @info("Test ...")
+        @info("Test requried...")
 
         # for query_structure in keys(test_queries)
         #    @info query_name_dict[query_structure] * ": " * "$(length(test_queries[query_structure]))"
@@ -381,8 +396,8 @@ function main(args)
         #         collate_fn=TestDataset.collate_fn)
     end
 
-    model = KGModule.KGReasoning(nentity,
-                                 nrelation,
+    model = KGModel.KGReasoning(nentity,
+                                nrelation,
                                  args["hidden_dim"],
                                  args["gamma"],
                                  args["geo"],
@@ -393,191 +408,168 @@ function main(args)
                                  args["cuda"] == "Yes")
 
     @info("Model Parameter Configuration:")
-    num_params = 0
     for (lindex,layer) in enumerate(Flux.params(model)) #.named_parameters()
         #@info("Parameter %s: %s, require_grad = %s" % (name, str(param.size()), str(param.requires_grad)))
         #if param.requires_grad
         #    num_params += np.prod(param.size())
         #end
+        num_params = 0
         for (pindex, pa) in enumerate(Flux.params(layer))
             @info("Parameter layer$lindex-$pindex: $(size(pa))")
             num_params += sum(length, Flux.params(layer))
         end
+        @info("Parameter Number: $num_params")
     end
-    @info("Parameter Number: $num_params")
-    #
-    #    if args["cuda"]
-    #        model = model.cuda()
-    #    end
-    #
-    #    if args["train"]
-    #        current_learning_rate = args["learning_rate"]
-    #        optimizer = torch.optim.Adam(
-    #            filter(lambda p: p.requires_grad, model.parameters()),
-    #            lr=current_learning_rate
-    #        )
-    #        warm_up_steps = args["max_steps"] // 2
-    #    end
-    #
-    #    if args["checkpoint_path"] is not Nothing
-    #        @info("Loading checkpoint $(args["checkpoint_path"]...")
-    #        checkpoint = torch.load(joinPath(args["checkpoint_path"], "checkpoint"))
-    #        init_step = checkpoint["step"]
-    #        model.load_state_dict(checkpoint["model_state_dict"])
-    #
-    #        if args["train"]
-    #            current_learning_rate = checkpoint["current_learning_rate"]
-    #            warm_up_steps = checkpoint["warm_up_steps"]
-    #            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    #        end
-    #    else
-    #        @info("Ramdomly Initializing $(args["geo"]) Model...")
-    #        init_step = 0
-    #    end
-    #
-    #    step = init_step
-    #    if args["geo"] == "box"
-    #        @info("box mode = $args["box_mode"]")
-    #    elif args["geo"] == "beta"
-    #        @info("beta mode = $($args["beta_mode"])")
-    #    end
-    #    @info("tasks = $(args["tasks"])")
-    #    @info("init_step = $init_step")
-    #    if args["train"]
-    #        @info("learning_rate = $current_learning_rate")
-    #    end
-    #    @info("batch_size = $(args["batch_size"])")
-    #    @info("hidden_dim = $(args["hidden_dim"])")
-    #    @info("gamma = $(args["gamma"])")
-    #
-    #    if args["train"]
-    #        @info("Start Training...")
-    #        training_logs = []
-    #        # #Training Loop
-    #        for step in range(init_step, args.max_steps):
-    #            if step == 2*args.max_steps//3
-    #                args.valid_steps *= 4
-    #            end
-    #
-    #            log = model.train_step(model, optimizer, train_path_iterator, args, step)
-    #            for metric in log
-    #                writer.add_scalar("path_"+metric, log[metric], step)
-    #            end
-    #            if train_other_iterator is not Nothing
-    #                log = model.train_step(model, optimizer, train_other_iterator, args, step)
-    #                for metric in log
-    #                    writer.add_scalar("other_"+metric, log[metric], step)
-    #                end
-    #                log = model.train_step(model, optimizer, train_path_iterator, args, step)
-    #            end
-    #
-    #            training_logs.append(log)
-    #
-    #            if step >= warm_up_steps
-    #                current_learning_rate = current_learning_rate / 5
-    #                @info("Change learning_rate to %f at step %d" % (current_learning_rate, step))
-    #                optimizer = torch.optim.Adam(
-    #                    filter(lambda p: p.requires_grad, model.parameters()),
-    #                    lr=current_learning_rate
-    #                )
-    #                warm_up_steps = warm_up_steps * 1.5
-    #            end
-    #
-    #            if step % args.save_checkpoint_steps == 0
-    #                save_variable_list = {
-    #                    "step": step,
-    #                    "current_learning_rate": current_learning_rate,
-    #                    "warm_up_steps": warm_up_steps
-    #                }
-    #                save_model(model, optimizer, save_variable_list, args)
-    #            end
-    #
-    #            if step % args.valid_steps == 0 and step > 0
-    #                if args.do_valid
-    #                    @info("Evaluating on Valid Dataset...")
-    #                    valid_all_metrics = evaluate(model, valid_easy_answers, valid_hard_answers, args, valid_dataloader, query_name_dict, "Valid", step, writer)
-    #                end
-    #
-    #                if args.do_test
-    #                    @info("Evaluating on Test Dataset...")
-    #                    test_all_metrics = evaluate(model, test_easy_answers, test_hard_answers, args, test_dataloader, query_name_dict, "Test", step, writer)
-    #                end
-    #            end
-    #
-    #            if step % args.log_steps == 0
-    #                metrics = {}
-    #                for metric in training_logs[0].keys():
-    #                    metrics[metric] = sum([log[metric] for log in training_logs])/len(training_logs)
-    #                end
-    #
-    #                log_metrics("Training average", step, metrics)
-    #                training_logs = []
-    #            end
-    #
-    #        save_variable_list = {
-    #            "step": step,
-    #            "current_learning_rate": current_learning_rate,
-    #            "warm_up_steps": warm_up_steps
-    #        }
-    #        save_model(model, optimizer, save_variable_list, args)
-    #
-    #    try
-    #        print (step)
-    #    catch
-    #        step = 0
-    #    end
-    #
+
+    if args["cuda"]
+        model = model.cuda()
+    end
+
+    local init_step, checkpoint, step, current_learning_rate, warn_up_steps
+    if args["train"]
+        current_learning_rate = args["learning_rate"]
+        opt_state = Flux.setup(Flux.Optimise.Adam(current_learning_rate), model)
+        warn_up_steps = floor(args["max_steps"] / 2)
+    end
+
+    if args["checkpoint_path"] != nothing
+        @info("Loading checkpoint $(args["checkpoint_path"])...")
+        checkpoint = Flux.loadmodel!(model, JLD2.load(joinPath(args["checkpoint_path"], "checkpoint"), "model_state"))
+        init_step = checkpoint["step"]
+        Flux.loadmodel!(model, checkpoint["model_state_dict"])
+        #model.load_state_dict(checkpoint["model_state_dict"])
+
+        if args["train"]
+            current_learning_rate = checkpoint["current_learning_rate"]
+            warn_up_steps = checkpoint["warn_up_steps"]
+            #optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        end
+        @info("Ramdomly Initializing $(args["geo"]) Model...")
+    else
+        @info("Ramdomly Initializing $(args["geo"]) Model...")
+        init_step = 0
+    end
+
+    step = init_step
+    if args["geo"] == "box"
+        @info("box mode = $(args["box_mode"])")
+    elseif args["geo"] == "beta"
+        @info("beta mode = $(args["beta_mode"])")
+    end
+    @info("tasks = $(args["tasks"])")
+    @info("init_step = $init_step")
+    if args["train"]
+        @info("learning_rate = $current_learning_rate")
+    end
+    @info("batch_size = $(args["batch_size"])")
+    @info("hidden_dim = $(args["hidden_dim"])")
+    @info("gamma = $(args["gamma"])")
+
+
+    if args["train"]
+        @info("Start Training...")
+        training_logs = []
+        # #Training Loop
+        local path_data; path_next=1;
+        local other_data; other_next=1;
+        for step in range(init_step, args["max_steps"])
+            if step == 2 * floor(args["max_steps"] / 3)
+                args["valid_steps"] *= 4
+            end
+
+            (path_data, path_next) = KGDataset.iterate(train_path_iterator, path_next)
+            println("path_data: $(path_data),\n path_next: $(path_next)")
+            println(typeof(train_path_dataset))
+            log = KGModel.train_step(model, opt_state, path_data, args, step)
+            for metric in log
+                writer.add_scalar("path_" * metric, log[metric], step)
+            end
+
+            if train_other_iterator != nothing
+                (other_data, other_next) = iterate(train_other_iterator, other_next)
+                log = KGModel.train_step(model, opt_state, other_data, args, step)
+                for metric in log
+                    @info "metric : $(metric)"
+                    writer.add_scalar("other_"+metric, log[metric], step)
+                end
+                log = KGModel.train_step(model, opt_state, train_path_iterator, args, step)
+            end
+
+            training_logs.append(log)
+
+            if step >= warn_up_steps
+                current_learning_rate = current_learning_rate / 5
+                @info("Change learning_rate to $(current_learning_rate) at step $(step)")
+
+                opt_state = Flux.setup(Flux.Optimiser.Adam(lr = current_learning_rate),
+                                       model)
+                warn_up_steps = warn_up_steps * 1.5
+            end
+
+            if step % args.save_checkpoint_steps == 0
+                save_variable_list = (
+                    "step": step,
+                    "current_learning_rate": current_learning_rate,
+                    "warm_up_steps": warn_up_steps
+                )
+                JLD2.save(model, opt_state, save_variable_list, args)
+            end
+
+            if step % args["valid_steps"] == 0 && step > 0
+                if args["do_valid"]
+                    @info("Evaluating on Valid Dataset...")
+                    valid_all_metrics = evaluate(model, valid_easy_answers, valid_hard_answers, args,
+                                                 valid_dataloader, query_name_dict, "Valid", step, writer)
+                end
+
+                if args["do_test"]
+                    @info("Evaluating on Test Dataset...")
+                    test_all_metrics = evaluate(model, test_easy_answers, test_hard_answers, args,
+                                                test_dataloader, query_name_dict, "Test", step, writer)
+                end
+            end
+
+            if step % args["log_steps"] == 0
+                metrics = Dict()
+                for metric in training_logs[0].keys()
+                    metrics[metric] = sum([log[metric] for log in training_logs])/len(training_logs)
+                end
+
+                log_metrics("Training average", step, metrics)
+                training_logs = []
+            end
+
+            save_variable_list = (
+                "step": step,
+                "current_learning_rate": current_learning_rate,
+                "warm_up_steps": warn_up_steps
+            )
+            JLD2.save(model, opt_state, save_variable_list, args)
+
+            try
+                print(step)
+            catch
+                step = 0
+            end
+        end
+        @info("Training finished!!")
+    end
+
     #    if args["test"]
     #        @info("Evaluating on Test Dataset...")
     #        test_all_metrics = evaluate(model, test_easy_answers, test_hard_answers, args, test_dataloader, query_name_dict, "Test", step, writer)
     #    end
     #
-    @info("Training finished!!")
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    args = Vector{String}(["--cuda", "--train", "--valid", "--test", "--data_path", "dataset/FB15k-betae",
-                           "-n", "128", "-b", "512", "-d", "800", "-g", "24","--lr", "0.0001", "--max_steps", "450001",
-                           "--cpu", "1", "--geo", "vec", "--valid_steps", "15000", "--tasks", "1p.2p.3p.2i.3i.ip.pi.2u.up"])
-    structed_args = parse_cmdargs(args);
-    println(structed_args)
+    args = Vector{String}(["--train", "--data_path", "dataset/FB15k-betae",
+                           "-n", "32", "-b", "4", "-d", "800", "-g", "24","--learning_rate",
+                           "0.0001", "--max_steps", "450001",
+                           "--cpu", "1", "--geo", "beta", "--valid_steps", "15000"])
+    #structed_args = parse_cmdargs(args);
+    #println(structed_args)
 
-    set_logger(structed_args);
+    main(args)
 
-    main(structed_args)
-    #=
-    str_tasks = "1p.2p.3p.2i.3i.ip.pi.2u.up";
-    tasks = split(str_tasks, ".");
-    args = Dict("data_path"=> joinpath(f_dir ,f_model), "evaluate_union"=>"DNF");
-
-    train_queries, train_answers, valid_queries, valid_hard_answers, valid_easy_answers, test_queries, test_hard_answers, test_easy_answers = load_data(args, tasks, all_tasks, name_query_dict);
-    train_flatten_queries = flatten_query(train_queries);
-    println("length of train_flatten_queries: " * "$(length(train_flatten_queries))")
-    println("length of train_answers: " * "$(length(train_answers))")
-    negative_sample_size = 512
-    batch_size = 128
-    nentity= sum([length(q) for q in train_flatten_queries])
-    nrelation= sum([length(q) for q in train_flatten_queries])
-    data_set = KGDataset.TrainDataset(train_flatten_queries, train_answers, nentity, nrelation, negative_sample_size);
-    #DataLoader(data; [batchsize, buffer, collate, parallel, partial, rng, shuffle])
-    data_loader = MLUtils.DataLoader(data_set, batchsize = batch_size, collate = true, shuffle=false);
-    println(typeof(data_loader.data))
-    println("nu, getobs.....")
-    train_path_iterator = SingleDirectionalOneShotIterator(data_loader);
-
-    data_index = 1
-    for item in train_path_iterator
-        println(item)
-        data_index += 1
-        if data_index >= 10
-            break
-        end
-    end
-
-    (item, next)  = iterate(train_path_iterator,data_index)
-    println(item)
-
-    (item, next)  = iterate(train_path_iterator, next)
-    println(item)
-    =#
 end
