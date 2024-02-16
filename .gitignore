@@ -2,6 +2,7 @@ dataset/
 logs/
 scalarlogs/
 logs-debug/
+src/.ipynb_checkpoints/
 
 *.log
 
