@@ -306,29 +306,37 @@ function main(cmd_args)
     @info("#relation: $(nrelation)")
     @info("#max steps: $(args["max_steps"])")
     @info("Evaluate unoins using: $(args["evaluate_union"])")
-
-    train_queries, train_answers, valid_queries, valid_hard_answers, valid_easy_answers,
-    test_queries, test_hard_answers, test_easy_answers = KGDataset.load_data(args, name_query_dict)
-    #=---------- for  test
+    @time begin
+        train_queries, train_answers, valid_queries, valid_hard_answers, valid_easy_answers,
+        test_queries, test_hard_answers, test_easy_answers = KGDataset.load_data(args, name_query_dict)
+    end
+    #---------- for  test
     flatten_queries = flatten_query(train_queries)
     t = length(flatten_queries)
     println(" flatten_queries length: $(t)")
-    train_dataset = KGDataset.TrainDataset(flatten_queries, train_answers, t, t, 32)
-    train_data_loader = MLUtils.DataLoader(train_dataset, batchsize = 4, collate = true, shuffle = false);
+    train_data = TrainDataset(flatten_queries, train_answers, t, t, 32)
+    train_data_loader = DataLoader(train_data, batchsize = 4, collate = true, shuffle = false);
     #for x in data_loader
     #    @info "data_loader loop...." * "$(size(x))"
     #end
     idx = 1
     for d in train_data_loader
+        println("data loader iter: xxxxxxxxxxxxxxxxxxxxx")
         println(d)
-        println("-----------------")
+        println("---------------------------------------")
         idx += 1
-        if idx > 9
+        if idx > 5
             break
         end
     end
+
+    path_data, state = iterate(train_data_loader)
+    println("iterator data 1: $(path_data)\n $(state)\n")
+    path_data, state = iterate(train_data_loader, state)
+    println("iterator data 2: $(path_data)\n *$(state)*\n")
     println("exit after iterator.....")
-    =#
+    exit()
+    ##
 
     local train_path_iterator, train_other_iterator
     if args["train"]
@@ -337,7 +345,6 @@ function main(cmd_args)
         train_other_queries = Dict{Any, Set}()
         query_path_list = ["1p", "2p", "3p"]
         for query_structure in keys(train_queries)
-            print(query_structure)
             if query_name_dict[query_structure] in query_path_list
                 train_path_queries[query_structure] = train_queries[query_structure]
             else
@@ -348,20 +355,19 @@ function main(cmd_args)
         train_path_queries = flatten_query(train_path_queries)
         @info "Flatten query length: $(length(train_path_queries)) typeof(query) $(typeof(train_path_queries))"
 
-        train_path_dataset = KGDataset.TrainDataset(train_path_queries, train_answers, nentity, nrelation, args["negative_sample_size"])
-        train_path_data_loader = MLUtils.DataLoader(train_path_dataset, batchsize = args["batch_size"], shuffle = false);
-        #for x in data_loader
-        #    @info "data_loader loop...." * "$(size(x))"
-        #end
-        train_path_iterator = KGDataset.SingleDirectionalOneShotIterator(train_path_data_loader);
+        train_path_dataset = KGDataset.TrainDataset(train_path_queries, train_answers, nentity, nrelation,
+                                                    args["negative_sample_size"])
+        train_path_dataloader = MLUtils.DataLoader(train_path_dataset, batchsize = args["batch_size"], shuffle = false);
+        #train_path_iterator = KGDataset.SingleDirectionalOneShotIterator(train_path_data_loader);
         #            num_workers=args.cpu_num,
         #            collate_fn=TrainDataset.collate_fn));
 
         if length(train_other_queries) > 0
             train_other_queries = flatten_query(train_other_queries)
-            train_other_dataset = KGDataset.TrainDataset(train_other_queries, train_answers, nentity, nrelation, args["negative_sample_size"])
+            train_other_dataset = KGDataset.TrainDataset(train_other_queries, train_answers, nentity, nrelation,
+                                                         args["negative_sample_size"])
             train_other_dataloader = MLUtils.DataLoader(train_other_dataset, batchsize=args["batch_size"], shuffle=true)
-            train_other_iterator = KGDataset.SingleDirectionalOneShotIterator(train_other_dataloader)
+            #train_other_iterator = KGDataset.SingleDirectionalOneShotIterator(train_other_dataloader)
             #_workers=args.cpu_num,
             #collate_fn=TrainDataset.collate_fn))
         else
@@ -477,7 +483,7 @@ function main(cmd_args)
                 args["valid_steps"] *= 4
             end
 
-            (path_data, path_next) = KGDataset.iterate(train_path_iterator, path_next)
+            (path_data, path_next) = iterate(train_path_dataloader, path_next)
             println("path_data: $(path_data),\n path_next: $(path_next)")
             println(typeof(train_path_dataset))
             log = KGModel.train_step(model, opt_state, path_data, args, step)
@@ -486,7 +492,7 @@ function main(cmd_args)
             end
 
             if train_other_iterator != nothing
-                (other_data, other_next) = iterate(train_other_iterator, other_next)
+                (other_data, other_next) = iterate(train_other_dataloader, other_next)
                 log = KGModel.train_step(model, opt_state, other_data, args, step)
                 for metric in log
                     @info "metric : $(metric)"

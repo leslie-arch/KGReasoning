@@ -2,13 +2,12 @@
 
 module KGDataset
 
-import MLUtils: DataLoader
-import Pickle
+using MLUtils
+using Pickle
 
 include("utils.jl")
-#using  .Utils
 
-export numobs, getobs, getindex, TrainDataset, TestDataset, SingleDirectionalOneShotIterator, load_data, iterate
+export numobs, getobs, getindex, TrainDataset, TestDataset, load_data, iterate
 
 abstract type Dataset end
 struct TrainDataset <: Dataset
@@ -55,14 +54,14 @@ function Base.length(data::TrainDataset)
     return length(data.queries)
 end
 
-function Base.getindex(data::TrainDataset, idx::Int)
+function Base.getindex(data::TrainDataset, idx)
+    println("Base.getindex idx: $(idx)")
 
     query = data.queries[idx][1]
     query_structure = data.queries[idx][2]
-    @info "TrainDataset [$(idx)] -> $(data.queries[idx]) answer: $(data.answer[query])"
+    #@info "Base.getindex: [$(idx)] -> $(data.queries[idx]) answer: $(data.answer[query])"
     tail = rand(collect(data.answer[query]))
     subsampling_weight = data.count[query]
-    @info "TrainDataset tail $(tail) subsampling_weight: $(subsampling_weight)"
     subsampling_weight = sqrt.(1 ./ [subsampling_weight])
     negative_sample_list = []
     negative_sample_size = 0
@@ -77,8 +76,7 @@ function Base.getindex(data::TrainDataset, idx::Int)
         mask = falses(data.negative_sample_size * 2)
         map(enumerate(avail_index)) do (x, y)
             if y != nothing
-                println("getobs set mask at $x int  $(Int(x)) max $(length(negative_sample))")
-                println("value: $(negative_sample[x])")
+                #println("getobs set mask at $x  value: $(negative_sample[x])")
                 mask[x] = true
             end
         end
@@ -92,59 +90,41 @@ function Base.getindex(data::TrainDataset, idx::Int)
     negative_sample = negative_sample # original: torch.from_numpy
     positive_sample = convert.(Float64, [tail])
 
-    @info "getobs one item -------------------------------------------------"
-    return positive_sample, negative_sample, subsampling_weight, flatten(query), query_structure
+    return positive_sample, negative_sample, subsampling_weight, flatten(query), [query_structure]
 end
 
 #Authors of custom data containers should implement Base.getindex for their type instead of getobs.
 #getobs should only be implemented for types where there is a difference between getobs and Base.getindex
 #(such as multi-dimensional arrays).
 
-#function getobs(data::TrainDataset, idx::Int)
-#    return getindex(data, idx)
+#function getobs(data::TrainDataset, idx...)
+#    println("getobs idx: $(idx)")
+#    return map(x -> getindex(data, x), idx);
 #end
 
 #=
 struct SingleDirectionalOneShotIterator
-    data_loader::DataLoader
+data_loader::DataLoader
 end
 
 
 function iterate(iter::SingleDirectionalOneShotIterator)
-    state = 1
-    if numobs(iter.data_loader.data) <= 0
-        return nothing
-    end
+state = 1
+if numobs(iter.data_loader.data) <= 0
+return nothing
+end
 
-    return ( getobs(iter.data_loader.data, state), state + 1 )
+return ( getobs(iter.data_loader.data, state), state + 1 )
 end
 
 function iterate(iter::SingleDirectionalOneShotIterator, state = 1)
-    if length(iter.data_loader.data.queries) < state
-        return nothing
-    end
+if length(iter.data_loader.data.queries) < state
+return nothing
+end
 
-    return ( getobs(iter.data_loader.data, state), state + 1 )
+return ( getobs(iter.data_loader.data, state), state + 1 )
 end
 =#
-
-function iterate(loader::DataLoader)
-    state = 1
-    if numobs(loader.data) <= 0
-        return nothing
-    end
-
-    return ( getobs(loader.data, state), state + 1 )
-end
-
-function iterate(loader::DataLoader, state = 1)
-    if numobs(loader.data) < state
-        return nothing
-    end
-
-    return ( getobs(loader, state), state + 1 )
-end
-
 
 struct TestDataset <: Dataset
     queries::Vector{Any}
@@ -166,20 +146,26 @@ function getobs(data::TestDataset, idx)
     negative_sample_size = 0
     while negative_sample_size < m.negative_sample_size
         negative_sample = np.random.randint(m.nentity, size=self.negative_sample_size*2)
-        mask = np.in1d(
-            negative_sample,
-            self.answer[query],
-            assume_unique=True,
-            invert=True
-        )
+        avail_index = indexin(negative_sample, collect(data.answer[query]))
+        mask = falses(data.negative_sample_size * 2)
+        map(enumerate(avail_index)) do (x, y)
+            if y != nothing
+                println("getobs set mask at $x int  $(Int(x)) max $(length(negative_sample))")
+                println("value: $(negative_sample[x])")
+                mask[x] = true
+            end
+        end
+        reverse!(mask)
+
         negative_sample = negative_sample[mask]
-        negative_sample_list.append(negative_sample)
-        negative_sample_size += negative_sample.size
+        append!(negative_sample_list, negative_sample)
+        negative_sample_size += length(negative_sample)
     end
-    negative_sample = np.concatenate(negative_sample_list)[:self.negative_sample_size]
-    negative_sample = torch.from_numpy(negative_sample)
-    positive_sample = torch.LongTensor([tail])
-    return positive_sample, negative_sample, subsampling_weight, flatten(query), query_structure
+    negative_sample = stack(negative_sample_list)[1:data.negative_sample_size]
+    negative_sample = negative_sample # original: torch.from_numpy
+    positive_sample = convert.(Float64, [tail])
+
+    return positive_sample, negative_sample, subsampling_weight, flatten(query), (query_structure)
 end
 
 function load_data(args, queries_dict)
@@ -217,7 +203,7 @@ function load_data(args, queries_dict)
 
             if !(name in valid_tasks) || evaluate_union != args["evaluate_union"]
                 query_structure = queries_dict[eval(if !('u' in name) name else join([name, evaluate_union], "-") end)]
-                println("load_data: deleteing structure...:\n $(query_structure)")
+                #println("load_data: deleteing structure...:\n $(query_structure)")
                 if haskey(train_queries, query_structure)
                     delete!(train_queries, query_structure);
                 end
