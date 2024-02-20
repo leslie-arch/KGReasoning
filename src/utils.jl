@@ -4,8 +4,14 @@
 
 #export flatten, format_time, eval_tuple, flatten_query;
 
-function flatten(l)
-    return collect(Iterators.flatten(l))
+function flatten(queries)
+    println("flatten: $(queries)")
+    x = collect(Iterators.flatten(queries))
+    println("$(x)")
+    fq =  map(q->collect(Iterators.flatten(q)), queries)
+    println("$(fq)")
+    println("------------------------")
+    return fq
 end
 
 function format_time()

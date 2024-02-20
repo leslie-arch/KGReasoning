@@ -902,30 +902,30 @@ function train_step(model::KGReasoning, opt_state, data, args, step)
     #opti_stat = Flux.setup(model, optimizer)
 
     #println("train_step data :: $(data)")
-    positive_sample, negative_sample, subsampling_weight, querie, query_structures = data
-    println("train_data: $(positive_sample), $(negative_sample), $(subsampling_weight), $(querie), $(query_structures)")
 
     #Flux.train!(loss, model, data, opt_state)# do model, data
 
     ########################################################################################################
     #model.train() # set model as train mode
     #optimizer.zero_grad() # clear grad, set to zero
-    positive_sample, negative_sample, subsampling_weight, querie, query_structures = data
-
+    positive_sample, negative_sample, subsampling_weight, queries, query_structures = data
+    println("train_data: $(positive_sample), $(negative_sample), $(subsampling_weight), $(queries), $(query_structures)")
     #batch_queries_dict = collections.defaultdict(list)
     #batch_idxs_dict = collections.defaultdict(list)
     batch_queries_dict = Dict{Any, Any}()
     batch_idxs_dict = Dict{Any, Any}()
-    for (i, query) in enumerate(querie) # group queries with same structure
+    for (i, query) in enumerate(queries) # group queries with same structure
         push!(get!(batch_queries_dict, query_structures[i], []), query)
         push!(get!(batch_idxs_dict, query_structures[i], []), i)
     end
+    @info "train_step: $(batch_queries_dict)"
+    @info "train_step: $(batch_idxs_dict)"
 
-    for query_structure in batch_queries_dict
+    for query_structure in keys(batch_queries_dict)
         if args["cuda"]
-            batch_queries_dict[query_structure] = Int64.(batch_queries_dict[query_structure]) .|> gpu
+            batch_queries_dict[query_structure] = Vector{Int64}.(batch_queries_dict[query_structure]) .|> gpu
         else
-            batch_queries_dict[query_structure] = Int64.(batch_queries_dict[query_structure])
+            batch_queries_dict[query_structure] = Vector{Int64}.(batch_queries_dict[query_structure])
         end
     end
 
@@ -934,6 +934,10 @@ function train_step(model::KGReasoning, opt_state, data, args, step)
         negative_sample = negative_sample |> gpu
         subsampling_weight = subsampling_weight |> gpu
     end
+
+    println("train_step positive_sample: $(positive_sample)")
+    println("train_step negative_sample: $(negative_sample)")
+    println("train_step subsampling_weight: $subsampling_weight")
 
     opt_grads = Flux.gradient(model) do m
         positive_logit, negative_logit,

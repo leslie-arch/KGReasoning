@@ -314,11 +314,18 @@ function main(cmd_args)
     flatten_queries = flatten_query(train_queries)
     t = length(flatten_queries)
     println(" flatten_queries length: $(t)")
-    train_data = TrainDataset(flatten_queries, train_answers, t, t, 32)
-    train_data_loader = DataLoader(train_data, batchsize = 4, collate = true, shuffle = false);
-    #for x in data_loader
-    #    @info "data_loader loop...." * "$(size(x))"
-    #end
+    train_data = TrainDataset(flatten_queries, train_answers, nentity, nrelation, 32)
+    train_data_loader = DataLoader(train_data, batchsize = args["batch_size"], collate=true,shuffle = false);
+
+    idx = 1
+    println("train answers:")
+    for a in train_answers
+        println(a)
+        idx += 1
+        if idx > 20
+            break
+        end
+    end
     idx = 1
     for d in train_data_loader
         println("data loader iter: xxxxxxxxxxxxxxxxxxxxx")
@@ -335,10 +342,10 @@ function main(cmd_args)
     path_data, state = iterate(train_data_loader, state)
     println("iterator data 2: $(path_data)\n *$(state)*\n")
     println("exit after iterator.....")
-    exit()
-    ##
+    #exit()
+    #
 
-    local train_path_iterator, train_other_iterator
+    local train_path_dataloader, train_other_dataloader
     if args["train"]
         @info("Train required...")
         train_path_queries = Dict{Any, Set}()
@@ -476,29 +483,33 @@ function main(cmd_args)
         @info("Start Training...")
         training_logs = []
         # #Training Loop
-        local path_data; path_next=1;
-        local other_data; other_next=1;
+        local path_data, path_next;
+        local other_data, other_next;
+        path_data, path_next = iterate(train_path_dataloader)
+        other_data, other_next = iterate(train_other_dataloader)
         for step in range(init_step, args["max_steps"])
             if step == 2 * floor(args["max_steps"] / 3)
                 args["valid_steps"] *= 4
             end
 
-            (path_data, path_next) = iterate(train_path_dataloader, path_next)
+
             println("path_data: $(path_data),\n path_next: $(path_next)")
-            println(typeof(train_path_dataset))
             log = KGModel.train_step(model, opt_state, path_data, args, step)
+            # data for next step
+            path_data, path_next = iterate(train_path_dataloader, path_next)
             for metric in log
                 writer.add_scalar("path_" * metric, log[metric], step)
             end
 
             if train_other_iterator != nothing
-                (other_data, other_next) = iterate(train_other_dataloader, other_next)
-                log = KGModel.train_step(model, opt_state, other_data, args, step)
+                log = KGModel.train_step(model, opt_state, train_other_dataloader, args, step)
+                other_data, other_next = iterate(train_other_dataloader, other_next)
                 for metric in log
                     @info "metric : $(metric)"
                     writer.add_scalar("other_"+metric, log[metric], step)
                 end
-                log = KGModel.train_step(model, opt_state, train_path_iterator, args, step)
+                log = KGModel.train_step(model, opt_state, train_path_dataloader, args, step)
+                other_data, other_next = iterate(train_other_dataloader, other_next)
             end
 
             training_logs.append(log)
