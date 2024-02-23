@@ -2,9 +2,10 @@
 
 module KGModel
 
+using Base: offset_if_vec
 using Zygote: AbstractFFTs
 export Identity, normDims, BoxOffsetIntersection, CenterIntersection, BetaIntersection,
-    BetaProjection, Regularizer, KGReasoning, train_step
+    BetaProjection, Regularizer, KGReasoning, KGRConfig, train_step
 
 using Flux;
 using Zygote;
@@ -23,7 +24,7 @@ function normDims(itr, p::Real=2; dim)
 end
 
 struct BoxOffsetIntersection
-    dim::Int
+    #dim::Int
     layer1::Flux.Dense
     layer2::Flux.Dense
 end
@@ -32,7 +33,7 @@ function BoxOffsetIntersection(dim::Int)
     layer1 = Flux.Dense(dim => dim);
     layer2 = Flux.Dense(dim => dim);
 
-    return BoxOffsetIntersection(dim, layer1, layer2);
+    return BoxOffsetIntersection(layer1, layer2);
 end
 
 #Function-like Object
@@ -52,7 +53,7 @@ end
 Flux.@functor BoxOffsetIntersection
 
 struct CenterIntersection
-    dim::Int
+    #dim::Int
     layer1::Flux.Dense
     layer2::Flux.Dense
 end
@@ -62,7 +63,7 @@ function CenterIntersection(dim::Int)
     layer2 = Flux.Dense(dim => dim)
 
     #Flux.Dense is initialized by  xavier defaultly
-    return CenterIntersection(dim, layer1, layer2)
+    return CenterIntersection(layer1, layer2)
 end
 
 function (m::CenterIntersection)(embeddings)
@@ -76,7 +77,7 @@ end
 Flux.@functor CenterIntersection
 
 struct BetaIntersection
-    dim::Int
+    #dim::Int
     layer1::Flux.Dense
     layer2::Flux.Dense
 end
@@ -85,7 +86,7 @@ function BetaIntersection(dim::Int)
     layer1 = Flux.Dense(2 * dim, 2 * dim)
     layer2 = Flux.Dense(2 * dim, dim)
 
-    return BetaIntersection(dim, layer1, layer2)
+    return BetaIntersection(layer1, layer2)
 end
 
 function (m::BetaIntersection)(alpha_embeddings, beta_embeddings)
@@ -114,10 +115,10 @@ end
 Flux.@functor Regularizer
 
 struct BetaProjection
-    entity_dim::Int
-    relation_dim::Int
-    hidden_dim::Int
-    num_layers::Int
+    #entity_dim::Int
+    #relation_dim::Int
+    #hidden_dim::Int
+    #num_layers::Int
 
     layers::Dict{Symbol, Flux.Dense}
     projection_regularizer
@@ -135,7 +136,7 @@ function Base.propertynames(m::BetaProjection, private = false)
     return keys(getproperty(m, :layers))
 end
 
-function BetaProjection(entity_dim, relation_dim, hidden_dim, projection_regularizer, num_layers)
+function BetaProjection(entity_dim, relation_dim, hidden_dim, num_layers, projection_regularizer)
     layer1 = Flux.Dense((entity_dim + relation_dim) => hidden_dim) # 1st layer
     layer0 = Flux.Dense(hidden_dim => entity_dim) # final layer
 
@@ -146,9 +147,7 @@ function BetaProjection(entity_dim, relation_dim, hidden_dim, projection_regular
         layers[Symbol("layer$(nl)")] = Flux.Dense(hidden_dim, hidden_dim)
     end
 
-    return BetaProjection(entity_dim, relation_dim, hidden_dim, num_layers,
-                          layers, projection_regularizer)
-
+    return BetaProjection(layers, projection_regularizer)
 end
 
 function (m::BetaProjection)(e_embedding, r_embedding)
@@ -164,72 +163,100 @@ end
 
 Flux.@functor BetaProjection
 
-struct KGReasoning
+Base.@kwdef mutable struct KGRConfig
     nentity::Int
     nrelation::Int
-    hidden_dim::Int
-    epsilon::AbstractFloat
     geo::String
     use_cuda::Bool
-    batch_entity_range #TODO type and initialize
-    query_name_dict::Dict{Tuple, String}
-    ############################################
-    gamma # nn.Parameter
-    embedding_range # nn.Parameter
 
+    batch_entity_range #TODO type and initialize
+
+    gamma::AbstractFloat
+    epsilon::AbstractFloat
+    hidden_dim::Int
     entity_dim::Int
     relation_dim::Int
+    query_name_dict::Dict{Tuple, String}
+
+    ######################################
+    box_activation::Union{Function, Missing} = missing
+    box_center::Union{Float64, Missing} = missing
+
+    beta_hidden_dim::Int
+    beta_num_layers::Int
+    beta_entity_regularizer::Union{Regularizer, Missing} = missing
+    beta_projection_regularizer::Union{Regularizer, Missing} = missing
+end
+
+function KGRConfig(nentity, nrelation, hidden_dim, gamma, query_name_dict, geo,
+                   box_mode=nothing, beta_mode=nothing,  cuda = false, batch = 1)
+    epsilon = 2.0
+    entity_dim = hidden_dim
+    relation_dim = hidden_dim
+    batch_entity_range = repeat(convert.(Float32, range(0, nentity - 1)), 1, batch)
+
+    local box_activation = missing
+    activation, box_center = box_mode
+    local beta_hidden_dim, beta_num_layers
+    beta_entity_regularizer, beta_projection_regularizer = (missing, missing)
+
+    if geo == "box"
+        if activation == "nothing"
+            box_activation = Identity;
+        elseif activation == "relu"
+            box_activation = Flux.relu;
+        elseif activation == "softplus"
+            box_activation = Flux.softplus;
+        end
+    elseif geo == "beta"
+        beta_hidden_dim, beta_num_layers = beta_mode
+        println("KGRConfig: beta_mode $(beta_mode) beta_hidden: $(beta_hidden_dim) num_layers: $(beta_num_layers)")
+        # make sure the parameters of beta embeddings are positive
+        beta_entity_regularizer = Regularizer(1, 0.05, 1e9)
+        # make sure the parameters of beta embeddings after relation projection are positive
+        beta_projection_regularizer = Regularizer(1, 0.05, 1e9)
+        println("KGRConfig: regularizer: $(beta_entity_regularizer)")
+        println("KGRConfig: regularizer: $(beta_projection_regularizer)")
+    end
+    println("box_mode: activation: $(activation) - $(box_activation) center: $(box_center)")
+    return KGRConfig(nentity, nrelation, geo, cuda,
+                     batch_entity_range,
+                     gamma, epsilon,
+                     hidden_dim, entity_dim, relation_dim,
+                     query_name_dict,
+                     box_activation, box_center,
+                     beta_hidden_dim, beta_num_layers,
+                     beta_entity_regularizer,
+                     beta_projection_regularizer)
+end
+
+Base.@kwdef mutable struct KGReasoning
+    gamma::Float64 # parame
+
+    embedding_range # parame
 
     entity_embedding # nn.Parameter
-    cen
-    func
-    entity_regularizer
-    projection_regularizer
-
+    relation_embedding
     offset_embedding
-    center_net
-    offset_net
-    #hidden_dim
-    num_layers
-    #center_net
-    projection_net
+
+    center_net::Union{BetaIntersection, CenterIntersection, Missing} = missing
+    offset_net::Union{BoxOffsetIntersection, Missing} = missing
+    projection_net::Union{BetaProjection, Missing} = missing
 end
 
 Flux.@functor KGReasoning
 
-function KGReasoning(nentity, nrelation, hidden_dim, gamma, geo, test_batch_size=1,
-                     box_mode=nothing, beta_mode=nothing, query_name_dict=nothing, use_cuda=false)
-    epsilon = 2.0
-
-    batch_entity_range = repeat(convert.(Float32, range(0, nentity - 1)), 1, test_batch_size)
-
-    gamma = Zygote.Params([gamma])
-    embedding_range = Zygote.Params([(gamma .+ epsilon) / hidden_dim]);
-
-    entity_dim = hidden_dim
-    relation_dim = hidden_dim
-
-    activation, cen, func = repeat([nothing], 3)
-    entity_embedding , entity_regularizer, projection_regularizer = repeat([nothing], 3)
-    if geo == "box"
-        entity_embedding = Zygote.Params(zeros(nentity, entity_dim)) # centor for entities
-        activation, cen = box_mode
-        cen = cen # hyperparameter that balances the in-box distance and the out-box distance
-        if activation == "none"
-            func = Identity;
-        elseif activation == "relu"
-            func = Flux.relu;
-        elseif activation == "softplus"
-            func = Flux.softplus;
-        end
-    elseif geo == "vec"
-        #entity_embedding = Flux.params(zeros(nentity, entity_dim)) # center for entities
-        entity_embedding = Zygote.Params(Flux.glorot_uniform(nentity, entity_dim))
-    elseif geo == "beta"
-        #entity_embedding = Flux.params(zeros(nentity, self.entity_dim * 2)) # alpha and beta
-        entity_embedding = Zygote.Params(Flux.glorot_uniform(nentity, entity_dim * 2))
-        entity_regularizer = Regularizer(1, 0.05, 1e9) # make sure the parameters of beta embeddings are positive
-        projection_regularizer = Regularizer(1, 0.05, 1e9) # make sure the parameters of beta embeddings after relation projection are positive
+function KGReasoning(conf, init = Flux.glorot_uniform)
+    gamma = conf.gamma
+    embedding_range = (gamma .+ conf.epsilon) / conf.hidden_dim
+    println("embedding_range: $(embedding_range) type: $(typeof(embedding_range))")
+    local entity_embedding
+    if conf.geo == "box"
+        entity_embedding = init(conf.nentity, conf.entity_dim) # centor for entities
+    elseif conf.geo == "vec"
+        entity_embedding = init(conf.nentity, conf.entity_dim)
+    elseif conf.geo == "beta"
+        entity_embedding = init(conf.nentity, conf.entity_dim * 2)
     end
     #nn.init.uniform_(
     #    tensor=self.entity_embedding,
@@ -238,51 +265,79 @@ function KGReasoning(nentity, nrelation, hidden_dim, gamma, geo, test_batch_size
     #    b = embedding_range
     #)
     #relation_embedding = Flux.params(zeros(nrelation, relation_dim))
-    relation_embedding = Zygote.Params(Flux.glorot_uniform(nrelation, relation_dim))
+    relation_embedding = init(conf.nrelation, conf.relation_dim)
+    println("relation_embedding: $(typeof(relation_embedding))")
     #nn.init.uniform_(
     #    tensor=relation_embedding,
     #    a = -embedding_range,
     #    b = embedding_range
     #)
 
-    num_layers, offset_embedding, center_net, offset_net, projection_net = repeat([nothing], 6)
-    if geo == "box"
-        offset_embedding = Zygote.Params(Flux.glorot_uniform(nrelation, entity_dim))
+    local offset_embedding, center_net, offset_net, projection_net = Vector{Missing}(undef, 4)
+    if conf.geo == "box"
+        offset_embedding = init(conf.nrelation, conf.entity_dim)
+        println("offset_embedding: $(typeof(offset_embedding))")
         #self.offset_embedding = nn.Parameter(torch.zeros(nrelation, self.entity_dim))
         #nn.init.uniform_(
         #    tensor=self.offset_embedding,
         #    a=0.,
         #    b=self.embedding_range.item()
         #)
-        center_net = CenterIntersection(entity_dim)
-        offset_net = BoxOffsetIntersection(entity_dim)
-    elseif geo == "vec"
-        center_net = CenterIntersection(entity_dim)
-    elseif geo == "beta"
-        hidden_dim, num_layers = eval_tuple(beta_mode)
-
-        center_net = BetaIntersection(entity_dim)
-        projection_net = BetaProjection(entity_dim * 2,
-                                        relation_dim,
-                                        hidden_dim,
-                                        projection_regularizer,
-                                        num_layers)
+        center_net = CenterIntersection(conf.entity_dim)
+        offset_net = BoxOffsetIntersection(conf.entity_dim)
+    elseif conf.geo == "vec"
+        center_net = CenterIntersection(conf.entity_dim)
+    elseif conf.geo == "beta"
+        center_net = BetaIntersection(conf.entity_dim)
+        projection_net = BetaProjection(conf.entity_dim * 2,
+                                        conf.relation_dim,
+                                        conf.beta_hidden_dim,
+                                        conf.beta_num_layers,
+                                        conf.beta_projection_regularizer)
     end
 
-    return KGReasoning(nentity, nrelation, hidden_dim, epsilon, geo, use_cuda, batch_entity_range,
-                       query_name_dict, gamma, embedding_range, entity_dim, relation_dim, entity_embedding,
-                       cen, func, entity_regularizer, projection_regularizer, offset_embedding,
-                       center_net, offset_net, num_layers, projection_net);
+    model =  KGReasoning(gamma, embedding_range,
+                         entity_embedding, relation_embedding, offset_embedding,
+                         center_net, offset_net, projection_net);
+
+    if conf.geo == "box"
+        @eval Flux.trainable(m::KGReasoning) = (m.gamma, m.embedding_range, m.entity_embedding, m.relation_embedding,
+                                                m.offset_embedding, m.center_net, m.offset_net)
+    elseif conf.geo == "vec"
+        @eval Flux.trainable(m::KGReasoning) = (m.gamma, m.embedding_range, m.entity_embedding, m.relation_embedding, m.center_net)
+    elseif conf.geo == "beta"
+        @eval Flux.trainable(m::KGReasoning) = (m.gamma, m.embedding_range, m.entity_embedding, m.relation_embedding,
+                                                m.center_net, m.projection_net)
+    end
+    return model
+end
+#
+#function set_trainable(m::KGReasoning, conf::KGRConfig)
+#    if conf.geo == "box"
+#        @eval Flux.trainable(m::KGReasoning) = (m.gamma, m.embedding_range, m.entity_embedding, m.relation_embedding,
+#                                                m.offset_embedding, m.center_net, m.offset_net)
+#    elseif conf.geo == "vec"
+#        @eval Flux.trainable(m::KGReasoning) = (m.gamma, m.embedding_range, m.entity_embedding, m.relation_embedding, m.center_net)
+#    elseif conf.geo == "beta"
+#        @eval Flux.trainable(m::KGReasoning) = (m.gamma, m.embedding_range, m.entity_embedding, m.relation_embedding,
+#                                                m.center_net, m.projection_net)
+#    end
+#end
+
+function forward(m::KGReasoning,conf::KGRConfig,
+                 positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
+    if conf.geo == "box"
+        return forward_box(m, conf, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
+    elseif conf.geo == "vec"
+        return forward_vec(m, conf, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
+    elseif conf.geo == "beta"
+        return forward_beta(m, conf, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
+    end
 end
 
-function forward(m::KGReasoning, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
-    if m.geo == "box"
-        return forward_box(m, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
-    elseif m.geo == "vec"
-        return forward_vec(m, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
-    elseif m.geo == "beta"
-        return forward_beta(m, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
-    end
+function (m::KGReasoning)(conf::KGRConfig,
+                          positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
+    forward(m, conf, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
 end
 
 ####
@@ -391,8 +446,14 @@ end
 Iterative embed a batch of queries with same structure using BetaE
 queries: a flattened batch of queries
 =#
-function embed_query_beta(m::KGReasoning, queries, query_structure, idx)
+function embed_query_beta(m::KGReasoning, conf::KGRConfig, queries, query_structure, idx)
+    #=
+    Iterative embed a batch of queries with same structure using BetaE
+    queries: a flattened batch of queries
 
+    * all the queries have the same structure(entitie and relation indexes)
+    =#
+    println("embed_query_beta: $(query_structure) idx: $(idx)")
     all_relation_flag = true
     # whether the current query tree has merged to one branch and only need to do relation traversal,
     # e.g., path queries or conjunctive queries after the intersection
@@ -402,13 +463,16 @@ function embed_query_beta(m::KGReasoning, queries, query_structure, idx)
             break
         end
     end
+    println("embed_query_beta: last $(last(query_structure))\n $(size(m.entity_embedding))")
+    println("embed_query_beta: queries: $(queries) \n entity embedding ndims: $(ndims(m.entity_embedding))")
     if all_relation_flag
         if query_structure[1] == "e"
-            embedding = m.entity_regularizer(selectdim(m.entity_embedding, dims=ndims(m.entity_embedding), queries[:, idx]))
+            embedding = conf.beta_entity_regularizer(selectdim(m.entity_embedding, dims=ndims(m.entity_embedding),
+                                                               queries[:, idx]))
             #embedding = m.entity_regularizer(torch.index_select(self.entity_embedding, dim=0, index=queries[:, idx]))
             idx += 1
         else
-            alpha_embedding, beta_embedding, idx = m.embed_query_beta(m, queries, query_structure[1], idx)
+            alpha_embedding, beta_embedding, idx = embed_query_beta(m, conf, queries, query_structure[1], idx)
             embedding = cat(alpha_embedding, beta_embedding, dim=0)
         end
         for i in range(1, length(last(query_structure)))
@@ -416,7 +480,7 @@ function embed_query_beta(m::KGReasoning, queries, query_structure, idx)
                 @assert (queries[:, idx] == -2).all()
                 embedding = 1 ./ embedding
             else
-                r_embedding = m.relation_embedding(queries[:, idx], :)
+                r_embedding = conf.relation_embedding(queries[:, idx], :)
                 #r_embedding = torch.index_select(self.relation_embedding, dim=0, index=queries[:, idx])
                 embedding = m.projection_net(embedding, r_embedding)
             end
@@ -428,7 +492,7 @@ function embed_query_beta(m::KGReasoning, queries, query_structure, idx)
         alpha_embedding_list = []
         beta_embedding_list = []
         for i in range(1, length(query_structure))
-            alpha_embedding, beta_embedding, idx = embed_query_beta(m, queries, query_structure[i], idx)
+            alpha_embedding, beta_embedding, idx = embed_query_beta(m, conf, queries, query_structure[i], idx)
             push!(alpha_embedding_list, alpha_embedding)
             push!(beta_embedding_list, beta_embedding)
         end
@@ -468,17 +532,20 @@ function cal_logit_beta(m::KGReasoning, entity_embedding, query_dist)
     return logit
 end
 
-function forward_beta(m::KGReasoning, positive_sample, negative_sample, subsampling_weight,
+function forward_beta(m::KGReasoning, conf::KGRConfig,
+                      positive_sample, negative_sample, subsampling_weight,
                       batch_queries_dict, batch_idxs_dict)
-    all_idxs, all_alpha_embeddings, all_beta_embeddings = [], [], []
-    all_union_idxs, all_union_alpha_embeddings, all_union_beta_embeddings = [], [], []
-    for query_structure in batch_queries_dict
-        if "u" in m.query_name_dict[query_structure] && "DNF" in m.query_name_dict[query_structure]
-            alpha_embedding, beta_embedding, _ = \
-                embed_query_beta(m, transform_union_query(m, batch_queries_dict[query_structure],
-                                                            query_structure),
-                                 transform_union_structure(m, query_structure),
-                                 0)
+    local all_idxs, all_alpha_embeddings, all_beta_embeddings,
+    all_union_idxs, all_union_alpha_embeddings, all_union_beta_embeddings
+
+    for query_structure in keys(batch_queries_dict)
+        println("forward_beta: query structure $(query_structure)")
+        if occursin('u', conf.query_name_dict[query_structure]) && occursin("DNF", conf.query_name_dict[query_structure])
+            alpha_embedding, beta_embedding, _ = embed_query_beta(m,
+                                                                  transform_union_query(m, batch_queries_dict[query_structure],
+                                                                                        query_structure),
+                                                                  transform_union_structure(m, query_structure),
+                                                                  0)
             push!(all_union_idxs, batch_idxs_dict[query_structure])
             #all_union_idxs.extend(batch_idxs_dict[query_structure])
             push!(all_union_alpha_embeddings, alpha_embedding)
@@ -504,7 +571,7 @@ function forward_beta(m::KGReasoning, positive_sample, negative_sample, subsampl
         all_dists = Distributions.Beta(all_alpha_embeddings, all_beta_embeddings)
     end
 
-    if len(all_union_alpha_embeddings) > 0
+    if length(all_union_alpha_embeddings) > 0
         #all_union_alpha_embeddings = torch.cat(all_union_alpha_embeddings, dim=0).unsqueeze(1)
         #all_union_beta_embeddings = torch.cat(all_union_beta_embeddings, dim=0).unsqueeze(1)
         #all_union_alpha_embeddings = all_union_alpha_embeddings.view(all_union_alpha_embeddings.shape[0]//2, 2, 1, -1)
@@ -534,14 +601,14 @@ function forward_beta(m::KGReasoning, positive_sample, negative_sample, subsampl
         subsampling_weight = subsampling_weight[all_idxs+all_union_idxs]
     end
 
-    if typeof(positive_sample) != type(None)
+    if typeof(positive_sample) != typeof(Nothing)
         if length(all_alpha_embeddings) > 0
             positive_sample_regular = positive_sample[all_idxs] # positive samples for non-union queries in this batch
             entity_embedding_select = selectdim(m.entity_embedding,
                                                 ndims(m.entity_embedding),
                                                 positive_sample_regular);
-            positive_embedding = m.entity_regularizer(unsqueeze(entity_embedding_select,
-                                                                ndims(entity_embedding_select)))
+            positive_embedding = conf.entity_regularizer(unsqueeze(entity_embedding_select,
+                                                                   ndims(entity_embedding_select)))
             positive_logit = cal_logit_beta(m, positive_embedding, all_dists)
         else
             positive_logit = [] .|> Flux.get_device()
@@ -555,7 +622,7 @@ function forward_beta(m::KGReasoning, positive_sample, negative_sample, subsampl
                                                 positive_sample_union);
             entity_embedding_select_unsqueeze = unsqueeze(entity_embedding_select,
                                                         dims=ndims(entity_embedding_select) - 1);
-            positive_embedding = m.entity_regularizer(entity_embedding_select_unsqueeze)
+            positive_embedding = conf.entity_regularizer(entity_embedding_select_unsqueeze)
             positive_union_logit = cal_logit_beta(m, positive_embedding, all_union_dists)
             positive_union_logit = max(positive_union_logit, dim=1)[0]
         else
@@ -582,7 +649,7 @@ function forward_beta(m::KGReasoning, positive_sample, negative_sample, subsampl
         if length(all_union_alpha_embeddings) > 0
             negative_sample_union = negative_sample[all_union_idxs]
             batch_size, negative_size = size(negative_sample_union)
-            negative_embedding = m.entity_regularizer(reshape(reshape(selectdim(m.entity_embedding, 0, negative_sample_union), :), (:, negative_size, 1, batch_size)))
+            negative_embedding = conf.entity_regularizer(reshape(reshape(selectdim(m.entity_embedding, 0, negative_sample_union), :), (:, negative_size, 1, batch_size)))
             negative_union_logit = cal_logit_beta(m, negative_embedding, all_union_dists)
             negative_union_logit = max(negative_union_logit, dim=2)[0]
         else
@@ -606,14 +673,14 @@ function cal_logit_box(m::KGReasoning, entity_embedding, query_center_embedding,
     return logit
 end
 
-function forward_box(m::KGReasoning, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
+function forward_box(m::KGReasoning, conf::KGRConfig, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
     all_center_embeddings, all_offset_embeddings, all_idxs = [], [], []
     all_union_center_embeddings, all_union_offset_embeddings, all_union_idxs = [], [], []
     for query_structure in batch_queries_dict
         if "u" in m.query_name_dict[query_structure]
             center_embedding, offset_embedding, _ = \
-                embed_query_box(m, m.transform_union_query(batch_queries_dict[query_structure],
-                                                                query_structure),
+                embed_query_box(m, transform_union_query(batch_queries_dict[query_structure],
+                                                         query_structure),
                                 transform_union_structure(m, query_structure),
                                 0)
             push!(all_union_center_embeddings, center_embedding)
@@ -737,7 +804,7 @@ function cal_logit_vec(m::KGReasoning, entity_embedding, query_embedding)
     return logit
 end
 
-function forward_vec(m::KGReasoning, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
+function forward_vec(m::KGReasoning, conf::KGRConfig, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
     all_center_embeddings, all_idxs = [], []
     all_union_center_embeddings, all_union_idxs = [], []
     for query_structure in batch_queries_dict
@@ -898,7 +965,7 @@ function loss(model, data)
 end
 
 # @staticmethod
-function train_step(model::KGReasoning, opt_state, data, args, step)
+function train_step(model::KGReasoning, conf::KGRConfig, opt_state, data, args, step)
     #opti_stat = Flux.setup(model, optimizer)
 
     #println("train_step data :: $(data)")
@@ -939,10 +1006,11 @@ function train_step(model::KGReasoning, opt_state, data, args, step)
     println("train_step negative_sample: $(negative_sample)")
     println("train_step subsampling_weight: $subsampling_weight")
 
+    local positive_sample_loss, negative_sample_loss, loss
     opt_grads = Flux.gradient(model) do m
         positive_logit, negative_logit,
-        subsampling_weight, _ = model(positive_sample, negative_sample,
-                                      subsampling_weight, batch_queries_dict, batch_idxs_dict)
+        subsampling_weight, _ = m(conf, positive_sample, negative_sample,
+                                  subsampling_weight, batch_queries_dict, batch_idxs_dict)
         negative_logsigmoid = Flux.logsigmoid(negative_logit)
         negative_score = mean.(negative_logsigmoid, dims=ndims(negative_logsigmoid))
         positive_logsigmoid =Flux.logsigmoid(positive_logit)

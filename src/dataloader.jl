@@ -103,8 +103,8 @@ function Base.getindex(data::TrainDataset, idx)
         #negative_sample = negative_sample # original: torch.from_numpy
     end
     positive_sample = convert.(Float64, tail)
-    @info "tail $(tail)"
-    @info "positive_sample: $(positive_sample)"
+    #@info "tail $(tail)"
+    #@info "positive_sample: $(positive_sample)"
     return positive_sample, negative_sample, subsampling_weight, flatten(query), query_structure
 end
 

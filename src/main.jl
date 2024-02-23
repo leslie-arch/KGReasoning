@@ -302,15 +302,22 @@ function main(cmd_args)
     @info(repeat("-------------------------------", 2))
     @info("Geo: $(args["geo"])")
     @info("Data Path: $(args["data_path"])")
-    @info("#entity: $(nentity)")
-    @info("#relation: $(nrelation)")
-    @info("#max steps: $(args["max_steps"])")
+    @info("nentity: $(nentity)")
+    @info("nrelation: $(nrelation)")
+    @info("max steps: $(args["max_steps"])")
     @info("Evaluate unoins using: $(args["evaluate_union"])")
+    @info("tasks = $(args["tasks"])")
+    @info("batch_size = $(args["batch_size"])")
+    @info("hidden_dim = $(args["hidden_dim"])")
+    @info("gamma = $(args["gamma"])")
+    @info("box_mode = $(eval_tuple(args["box_mode"]))")
+    @info("beta_mode: $(eval_tuple(args["beta_mode"]))")
+
     @time begin
         train_queries, train_answers, valid_queries, valid_hard_answers, valid_easy_answers,
         test_queries, test_hard_answers, test_easy_answers = KGDataset.load_data(args, name_query_dict)
     end
-    #---------- for  test
+    #=---------- for  test
     flatten_queries = flatten_query(train_queries)
     t = length(flatten_queries)
     println(" flatten_queries length: $(t)")
@@ -343,7 +350,7 @@ function main(cmd_args)
     println("iterator data 2: $(path_data)\n *$(state)*\n")
     println("exit after iterator.....")
     #exit()
-    #
+    =#
 
     local train_path_dataloader, train_other_dataloader
     if args["train"]
@@ -388,8 +395,8 @@ function main(cmd_args)
         #for query_structure in keys(valid_queries)
         #    @info query_name_dict[query_structure] * ": " * "$(length(valid_queries[query_structure]))"
         # end
-        valid_queries2 = flatten_query(valid_queries)
-        valid_dataloader = KGDataset.DataLoader(KGDataset.TestDataset(valid_queries2, nentity, nrelation),
+        valid_all_queries = flatten_query(valid_queries)
+        valid_dataloader = KGDataset.DataLoader(KGDataset.TestDataset(valid_all_queries, nentity, nrelation),
                                                 batchsize=args["test_batch_size"]);
         #            num_workers=args.cpu_num,
         #            collate_fn=TestDataset.collate_fn)
@@ -409,17 +416,18 @@ function main(cmd_args)
         #         collate_fn=TestDataset.collate_fn)
     end
 
-    model = KGModel.KGReasoning(nentity,
-                                nrelation,
-                                 args["hidden_dim"],
-                                 args["gamma"],
-                                 args["geo"],
-                                 args["test_batch_size"],
-                                 eval_tuple(args["box_mode"]),
-                                 eval_tuple(args["beta_mode"]),
-                                 query_name_dict,
-                                 args["cuda"] == "Yes")
+    conf = KGRConfig(nentity,
+                     nrelation,
+                     args["hidden_dim"],
+                     args["gamma"],
+                     query_name_dict,
+                     args["geo"],
+                     eval_tuple(args["box_mode"]),
+                     eval_tuple(args["beta_mode"]),
+                     args["cuda"] == "Yes")
 
+    model = KGModel.KGReasoning(conf)
+    #KGModel.set_trainable(model, conf)
     @info("Model Parameter Configuration:")
     for (lindex,layer) in enumerate(Flux.params(model)) #.named_parameters()
         #@info("Parameter %s: %s, require_grad = %s" % (name, str(param.size()), str(param.requires_grad)))
@@ -457,7 +465,6 @@ function main(cmd_args)
             warn_up_steps = checkpoint["warn_up_steps"]
             #optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         end
-        @info("Ramdomly Initializing $(args["geo"]) Model...")
     else
         @info("Ramdomly Initializing $(args["geo"]) Model...")
         init_step = 0
@@ -469,18 +476,12 @@ function main(cmd_args)
     elseif args["geo"] == "beta"
         @info("beta mode = $(args["beta_mode"])")
     end
-    @info("tasks = $(args["tasks"])")
-    @info("init_step = $init_step")
     if args["train"]
         @info("learning_rate = $current_learning_rate")
     end
-    @info("batch_size = $(args["batch_size"])")
-    @info("hidden_dim = $(args["hidden_dim"])")
-    @info("gamma = $(args["gamma"])")
-
 
     if args["train"]
-        @info("Start Training...")
+        @info("Start Training init_step: $(init_step)...")
         training_logs = []
         # #Training Loop
         local path_data, path_next;
@@ -494,7 +495,7 @@ function main(cmd_args)
 
 
             println("path_data: $(path_data),\n path_next: $(path_next)")
-            log = KGModel.train_step(model, opt_state, path_data, args, step)
+            log = KGModel.train_step(model, conf, opt_state, path_data, args, step)
             # data for next step
             path_data, path_next = iterate(train_path_dataloader, path_next)
             for metric in log
@@ -502,13 +503,13 @@ function main(cmd_args)
             end
 
             if train_other_iterator != nothing
-                log = KGModel.train_step(model, opt_state, train_other_dataloader, args, step)
+                log = KGModel.train_step(model, conf, opt_state, train_other_dataloader, args, step)
                 other_data, other_next = iterate(train_other_dataloader, other_next)
                 for metric in log
                     @info "metric : $(metric)"
                     writer.add_scalar("other_"+metric, log[metric], step)
                 end
-                log = KGModel.train_step(model, opt_state, train_path_dataloader, args, step)
+                log = KGModel.train_step(model, conf, opt_state, train_path_dataloader, args, step)
                 other_data, other_next = iterate(train_other_dataloader, other_next)
             end
 
