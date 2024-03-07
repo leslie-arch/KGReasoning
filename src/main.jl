@@ -1,4 +1,4 @@
-#!/home/leslie/julia/1.10.0/bin/julia
+#!/usr/bin/env julia
 
 using MLUtils
 using Random
@@ -136,7 +136,7 @@ function parse_cmdargs(args::Vector{String})
         arg_type=String
         help="tasks connected by dot, refer to the BetaE paper for detailed meaning and structure of each task"
         "--seed"
-        default=0
+        default=1024
         arg_type=Int
         help="random seed"
         "--beta_mode"
@@ -197,15 +197,15 @@ end
 Print the evaluation logs
 """=#
 function log_metrics(mode, step, metrics)
-    for metric in metrics
-        @info "$mode $metric at step $(step): $(metrics[metric.first])"
+    for m in metrics
+        @info "$mode $m.first at step $(step): $(m.second)"
     end
 end
 
 #="""
 Evaluate queries in dataloader
 """=#
-function evaluate(model, tp_answers, fn_answers, args, dataloader, query_name_dict, mode, step, writer)
+function evaluate(model, tp_answers, fn_answers, args, dataloader, query_name_dict, mode, step, tblogger)
 
     average_metrics = Dict{Float}()
     all_metrics = Dict{Float}()
@@ -217,8 +217,10 @@ function evaluate(model, tp_answers, fn_answers, args, dataloader, query_name_di
         log_metrics(mode * " " * query_name_dict[query_structure], step, metrics[query_structure])
 
         for metric in metrics[query_structure]
-            writer.add_scalar("_".join([mode, query_name_dict[query_structure], metric]), metrics[query_structure][metric], step)
-            all_metrics["_".join([query_name_dict[query_structure], metric])] = metrics[query_structure][metric]
+            with_logger(tblogger) do
+                @info join([mode, query_name_dict[query_structure], metric], "_") metrics[query_structure][metric] = step
+            end
+            all_metrics[join([query_name_dict[query_structure], metric], "_")] = metrics[query_structure][metric]
             if metric != "num_queries"
                 average_metrics[metric] += metrics[query_structure][metric]
             end
@@ -229,8 +231,10 @@ function evaluate(model, tp_answers, fn_answers, args, dataloader, query_name_di
 
     for metric in average_metrics
         average_metrics[metric] /= num_query_structures
-        writer.add_scalar("_".join([mode, "average", metric]), average_metrics[metric], step)
-        all_metrics["_".join(["average", metric])] = average_metrics[metric]
+        with_logger(tblogger) do
+            @info join([mode, "average", metric], "_") average_metrics[metric] = step
+        end
+        all_metrics[join(["average", metric], "_")] = average_metrics[metric]
     end
 
     log_metrics("$mode average", step, average_metrics)
@@ -240,7 +244,7 @@ end
 function main(cmd_args)
     #global train_queries, train_answers, valid_queries, valid_hard_answers, valid_easy_answers, test_queries, test_hard_answers, test_easy_answers
     args = parse_cmdargs(cmd_args)
-    set_logger(args);
+
     Random.seed!(args["seed"])
     tasks = split(args["tasks"], ".")
     for task in tasks
@@ -254,7 +258,7 @@ function main(cmd_args)
 
     cur_time = format_time()
     if args["prefix"] == nothing
-        prefix = "logs"
+        prefix = "stage_out"
     else
         prefix = args["prefix"]
     end
@@ -279,14 +283,13 @@ function main(cmd_args)
     if ! ispath(args["save_path"])
         mkpath(args["save_path"])
     end
-
+    set_logger(args)
     @info ("logging to $(args["save_path"])")
     if ! args["train"] # if not training, then create tensorboard files in some tmp location
-        writer = TBLogger("./logs-debug/unused-tb")
+        tblogger = TBLogger("./$(prefix)/unused-tb")
     else
-        writer = TBLogger(args["save_path"])
+        tblogger = TBLogger(args["save_path"])
     end
-    set_logger(args)
 
     nentity, nrelation = open(joinpath(args["data_path"], "stats.txt")) do f
         entrel = readlines(f)
@@ -317,40 +320,6 @@ function main(cmd_args)
         train_queries, train_answers, valid_queries, valid_hard_answers, valid_easy_answers,
         test_queries, test_hard_answers, test_easy_answers = KGDataset.load_data(args, name_query_dict)
     end
-    #=---------- for  test
-    flatten_queries = flatten_query(train_queries)
-    t = length(flatten_queries)
-    println(" flatten_queries length: $(t)")
-    train_data = TrainDataset(flatten_queries, train_answers, nentity, nrelation, 32)
-    train_data_loader = DataLoader(train_data, batchsize = args["batch_size"], collate=true,shuffle = false);
-
-    idx = 1
-    println("train answers:")
-    for a in train_answers
-        println(a)
-        idx += 1
-        if idx > 20
-            break
-        end
-    end
-    idx = 1
-    for d in train_data_loader
-        println("data loader iter: xxxxxxxxxxxxxxxxxxxxx")
-        println(d)
-        println("---------------------------------------")
-        idx += 1
-        if idx > 5
-            break
-        end
-    end
-
-    path_data, state = iterate(train_data_loader)
-    println("iterator data 1: $(path_data)\n $(state)\n")
-    path_data, state = iterate(train_data_loader, state)
-    println("iterator data 2: $(path_data)\n *$(state)*\n")
-    println("exit after iterator.....")
-    #exit()
-    =#
 
     local train_path_dataloader, train_other_dataloader
     if args["train"]
@@ -371,49 +340,33 @@ function main(cmd_args)
 
         train_path_dataset = KGDataset.TrainDataset(train_path_queries, train_answers, nentity, nrelation,
                                                     args["negative_sample_size"])
+
         train_path_dataloader = MLUtils.DataLoader(train_path_dataset, batchsize = args["batch_size"], shuffle = false);
-        #train_path_iterator = KGDataset.SingleDirectionalOneShotIterator(train_path_data_loader);
-        #            num_workers=args.cpu_num,
-        #            collate_fn=TrainDataset.collate_fn));
 
         if length(train_other_queries) > 0
             train_other_queries = flatten_query(train_other_queries)
             train_other_dataset = KGDataset.TrainDataset(train_other_queries, train_answers, nentity, nrelation,
                                                          args["negative_sample_size"])
             train_other_dataloader = MLUtils.DataLoader(train_other_dataset, batchsize=args["batch_size"], shuffle=true)
-            #train_other_iterator = KGDataset.SingleDirectionalOneShotIterator(train_other_dataloader)
-            #_workers=args.cpu_num,
-            #collate_fn=TrainDataset.collate_fn))
         else
-            train_other_iterator = nothing
+            train_other_dataloader = nothing
         end
     end
 
     if args["valid"]
         @info("Validation required...")
 
-        #for query_structure in keys(valid_queries)
-        #    @info query_name_dict[query_structure] * ": " * "$(length(valid_queries[query_structure]))"
-        # end
         valid_all_queries = flatten_query(valid_queries)
         valid_dataloader = KGDataset.DataLoader(KGDataset.TestDataset(valid_all_queries, nentity, nrelation),
                                                 batchsize=args["test_batch_size"]);
-        #            num_workers=args.cpu_num,
-        #            collate_fn=TestDataset.collate_fn)
     end
 
     if args["test"]
         @info("Test requried...")
 
-        # for query_structure in keys(test_queries)
-        #    @info query_name_dict[query_structure] * ": " * "$(length(test_queries[query_structure]))"
-        # end
         test_queries = flatten_query(test_queries)
-        test_dataloader = KGDataset.DataLoader(
-            KGDataset.TestDataset(test_queries, nentity, nrelation),
-            batchsize=args["test_batch_size"]);
-        #         num_workers=args.cpu_num,
-        #         collate_fn=TestDataset.collate_fn)
+        test_dataloader = KGDataset.DataLoader(KGDataset.TestDataset(test_queries, nentity, nrelation),
+                                               batchsize=args["test_batch_size"]);
     end
 
     conf = KGRConfig(nentity,
@@ -427,13 +380,10 @@ function main(cmd_args)
                      args["cuda"] == "Yes")
 
     model = KGModel.KGReasoning(conf)
-    #KGModel.set_trainable(model, conf)
+    Flux.f64(model)
+    #=
     @info("Model Parameter Configuration:")
     for (lindex,layer) in enumerate(Flux.params(model)) #.named_parameters()
-        #@info("Parameter %s: %s, require_grad = %s" % (name, str(param.size()), str(param.requires_grad)))
-        #if param.requires_grad
-        #    num_params += np.prod(param.size())
-        #end
         num_params = 0
         for (pindex, pa) in enumerate(Flux.params(layer))
             @info("Parameter layer$lindex-$pindex: $(size(pa))")
@@ -441,7 +391,7 @@ function main(cmd_args)
         end
         @info("Parameter Number: $num_params")
     end
-
+    =#
     if args["cuda"]
         model = model.cuda()
     end
@@ -493,96 +443,95 @@ function main(cmd_args)
                 args["valid_steps"] *= 4
             end
 
-
-            println("path_data: $(path_data),\n path_next: $(path_next)")
             log = KGModel.train_step(model, conf, opt_state, path_data, args, step)
             # data for next step
             path_data, path_next = iterate(train_path_dataloader, path_next)
             for metric in log
-                writer.add_scalar("path_" * metric, log[metric], step)
+                with_logger(tblogger) do
+                    @info "path_" * "$(metric)" log[metric] = step
+                end
             end
 
-            if train_other_iterator != nothing
-                log = KGModel.train_step(model, conf, opt_state, train_other_dataloader, args, step)
+            if train_other_dataloader != nothing
+                log = KGModel.train_step(model, conf, opt_state, other_data, args, step)
                 other_data, other_next = iterate(train_other_dataloader, other_next)
                 for metric in log
                     @info "metric : $(metric)"
-                    writer.add_scalar("other_"+metric, log[metric], step)
+                    with_logger(tblogger) do
+                        @info "other_" * "$(metric)" log[metric] = step
+                    end
                 end
-                log = KGModel.train_step(model, conf, opt_state, train_path_dataloader, args, step)
-                other_data, other_next = iterate(train_other_dataloader, other_next)
+                log = KGModel.train_step(model, conf, opt_state, path_data, args, step)
+                path_data, path_next = iterate(train_path_dataloader, other_next)
             end
 
-            training_logs.append(log)
+            push!(training_logs, log)
 
             if step >= warn_up_steps
                 current_learning_rate = current_learning_rate / 5
                 @info("Change learning_rate to $(current_learning_rate) at step $(step)")
 
-                opt_state = Flux.setup(Flux.Optimiser.Adam(lr = current_learning_rate),
-                                       model)
+                opt_state = Flux.setup(Flux.Optimiser.Adam(lr = current_learning_rate), model)
                 warn_up_steps = warn_up_steps * 1.5
             end
 
-            if step % args.save_checkpoint_steps == 0
+            if step % args["save_checkpoint_steps"] == 0
                 save_variable_list = (
-                    "step": step,
-                    "current_learning_rate": current_learning_rate,
-                    "warm_up_steps": warn_up_steps
+                    "step"=> step,
+                    "current_learning_rate" => current_learning_rate,
+                    "warm_up_steps" => warn_up_steps
                 )
-                JLD2.save(model, opt_state, save_variable_list, args)
+                JLD2.save(joinpath(args["save_path"], "checkpoint-$(step).jld2"),model_state = Flux.state(model), opt = opt_state, variables = save_variable_list, params = args)
             end
 
             if step % args["valid_steps"] == 0 && step > 0
                 if args["do_valid"]
                     @info("Evaluating on Valid Dataset...")
                     valid_all_metrics = evaluate(model, valid_easy_answers, valid_hard_answers, args,
-                                                 valid_dataloader, query_name_dict, "Valid", step, writer)
+                                                 valid_dataloader, query_name_dict, "Valid", step, tblogger)
                 end
 
                 if args["do_test"]
                     @info("Evaluating on Test Dataset...")
                     test_all_metrics = evaluate(model, test_easy_answers, test_hard_answers, args,
-                                                test_dataloader, query_name_dict, "Test", step, writer)
+                                                test_dataloader, query_name_dict, "Test", step, tblogger)
                 end
             end
 
             if step % args["log_steps"] == 0
                 metrics = Dict()
-                for metric in training_logs[0].keys()
-                    metrics[metric] = sum([log[metric] for log in training_logs])/len(training_logs)
+                println("main: $(training_logs)")
+                if(length(training_logs) > 0)
+                    for metric in keys(training_logs[1])
+                        metrics[metric] = sum([log[metric] for log in training_logs])/length(training_logs)
+                    end
                 end
 
                 log_metrics("Training average", step, metrics)
                 training_logs = []
             end
-
+            #=
             save_variable_list = (
-                "step": step,
-                "current_learning_rate": current_learning_rate,
-                "warm_up_steps": warn_up_steps
+                "step" => step,
+                "current_learning_rate" => current_learning_rate,
+                "warm_up_steps" => warn_up_steps
             )
-            JLD2.save(model, opt_state, save_variable_list, args)
-
-            try
-                print(step)
-            catch
-                step = 0
-            end
+            JLD2.save(joinpath(args["save_path"], "checkpoint-$(step).jld2"),model_state = Flux.state(model), opt = opt_state, variables = save_variable_list, params = args)
+            =#
         end
         @info("Training finished!!")
     end
 
     #    if args["test"]
     #        @info("Evaluating on Test Dataset...")
-    #        test_all_metrics = evaluate(model, test_easy_answers, test_hard_answers, args, test_dataloader, query_name_dict, "Test", step, writer)
+    #        test_all_metrics = evaluate(model, test_easy_answers, test_hard_answers, args, test_dataloader, query_name_dict, "Test", step, tblogger)
     #    end
     #
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
     args = Vector{String}(["--train", "--data_path", "dataset/FB15k-betae",
-                           "-n", "32", "-b", "4", "-d", "800", "-g", "24","--learning_rate",
+                           "-n", "32", "-b", "4", "-d", "64", "-g", "24","--learning_rate",
                            "0.0001", "--max_steps", "450001",
                            "--cpu", "1", "--geo", "beta", "--valid_steps", "15000"])
     #structed_args = parse_cmdargs(args);

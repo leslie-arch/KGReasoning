@@ -1,5 +1,5 @@
 dataset/
-logs/
+stage_out/
 scalarlogs/
 logs-debug/
 src/.ipynb_checkpoints/

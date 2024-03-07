@@ -1,17 +1,28 @@
-#!/home/leslie/julia/1.10.0/bin/julia
+#!/usr/bin/env julia
 
 #module Utils
 
 #export flatten, format_time, eval_tuple, flatten_query;
 
+function norm(x, p, dims=1)
+    sum(abs(x) .^ p, dims) .^ (1 / p)
+end
+
+function nest_flatten(arr)
+	rst = Int[]
+	grep(v) = 	for x in v
+		if isa(x, Tuple)
+			grep(x)
+		else
+            push!(rst, x)
+        end
+	end
+	grep(arr)
+	rst
+end
+
 function flatten(queries)
-    println("flatten: $(queries)")
-    x = collect(Iterators.flatten(queries))
-    println("$(x)")
-    fq =  map(q->collect(Iterators.flatten(q)), queries)
-    println("$(fq)")
-    println("------------------------")
-    return fq
+    return map(q->nest_flatten(q), queries)
 end
 
 function format_time()

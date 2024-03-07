@@ -1,4 +1,4 @@
-#!/home/leslie/julia/1.10.0/bin/julia
+#!/usr/bin/env julia
 
 module KGDataset
 
@@ -19,7 +19,7 @@ struct TrainDataset <: Dataset
     count::Dict{Tuple, Int}
 end
 #=
-function collate_fn(data::TrainDataset)
+function collate_fn(data::Tuple)
 positive_sample = cat([_[0] for _ in data], dim=0)
 negative_sample = stack([_[1] for _ in data], dim=0)
 subsample_weight = cat([_[2] for _ in data], dim=0)
@@ -56,28 +56,28 @@ end
 
 function Base.getindex(data::TrainDataset, idx)
     if isa(idx, Int) idx = [idx] end
-    println("Base.getindex idx: $(idx)")
+    #println("Base.getindex idx: $(idx)")
 
-    query_name_vec = data.queries[idx]
+    #query_name_vec = data.queries[idx]
     query = first.(data.queries[idx])
     query_structure = last.(data.queries[idx])
-    @info "Base.getindex: [$(idx)] -> $(query_name_vec)"
-    @info "query: $(query)"
-    @info "query_structure: $(query_structure)"
+    #@info "Base.getindex: [$(idx)] -> $(query_name_vec)"
+    #@info "query: $(query)"
+    #@info "query_structure: $(query_structure)"
 
-    tail = map(s->rand(collect(data.answer[s])), query)
+    answers = map(s->rand(collect(data.answer[s])), query)
     subsampling_weight = map(q->data.count[q], query)
     subsampling_weight = sqrt.(1 ./ subsampling_weight)
 
     local positive_sample, negative_sample
 
-    negative_sample = []
+    negative_sample = Vector{Vector{Int}}()
     map(query) do q
-        negative_sample_item = []
+        negative_sample_item = Vector{Int}()
         partial_negative_sample_size = 0
         partial_negative_sample_list = []
         while partial_negative_sample_size < data.negative_sample_size
-            partial_negative_sample_list = rand(1:data.nentity, data.negative_sample_size*2)
+            partial_negative_sample_list = rand(0:(data.nentity - 1), data.negative_sample_size*2)
             # check whether the items in ar1 belong to ar2, return a vector
             # has the same length with ar1, filled with true or false
             #mask = np.in1d(negative_sample, data.answer[query],
@@ -102,7 +102,7 @@ function Base.getindex(data::TrainDataset, idx)
         push!(negative_sample, negative_sample_item[1:data.negative_sample_size])
         #negative_sample = negative_sample # original: torch.from_numpy
     end
-    positive_sample = convert.(Float64, tail)
+    positive_sample = convert.(Int, answers)
     #@info "tail $(tail)"
     #@info "positive_sample: $(positive_sample)"
     return positive_sample, negative_sample, subsampling_weight, flatten(query), query_structure
@@ -155,35 +155,57 @@ function numobs(data::TestDataset)
 end
 
 function getobs(data::TestDataset, idx)
-    query = data.queries[idx][0]
-    query_structure = data.queries[idx][1]
-    tail = rand(data.answer[query])
-    subsampling_weight = data.count[query]
-    subsampling_weight = sqrt.(1 / [subsampling_weight])
-    negative_sample_list = []
-    negative_sample_size = 0
-    while negative_sample_size < m.negative_sample_size
-        negative_sample = rand(1:data.nentity, data.negative_sample_size*2)
-        avail_index = indexin(negative_sample, collect(data.answer[query]))
-        mask = falses(data.negative_sample_size * 2)
-        map(enumerate(avail_index)) do (x, y)
-            if y != nothing
-                println("getobs set mask at $x int  $(Int(x)) max $(length(negative_sample))")
-                println("value: $(negative_sample[x])")
-                mask[x] = true
+    if isa(idx, Int) idx = [idx] end
+    #println("Base.getindex idx: $(idx)")
+
+    #query_name_vec = data.queries[idx]
+    query = first.(data.queries[idx])
+    query_structure = last.(data.queries[idx])
+    #@info "Base.getindex: [$(idx)] -> $(query_name_vec)"
+    #@info "query: $(query)"
+    #@info "query_structure: $(query_structure)"
+
+    answers = map(s->rand(collect(data.answer[s])), query)
+    subsampling_weight = map(q->data.count[q], query)
+    subsampling_weight = sqrt.(1 ./ subsampling_weight)
+
+    local positive_sample, negative_sample
+
+    negative_sample = Vector{Vector{Int}}()
+    map(query) do q
+        negative_sample_item = Vector{Int}()
+        partial_negative_sample_size = 0
+        partial_negative_sample_list = []
+        while partial_negative_sample_size < data.negative_sample_size
+            partial_negative_sample_list = rand(0:(data.nentity - 1), data.negative_sample_size*2)
+            # check whether the items in ar1 belong to ar2, return a vector
+            # has the same length with ar1, filled with true or false
+            #mask = np.in1d(negative_sample, data.answer[query],
+            #               assume_unique=true, invert=true)
+
+            avail_index = indexin(partial_negative_sample_list, collect(data.answer[q]))
+            mask = falses(data.negative_sample_size * 2)
+            map(enumerate(avail_index)) do (x, y)
+                if y != nothing
+                    #println("getobs set mask at $x  value: $(negative_sample[x])")
+                    mask[x] = true
+                end
             end
+            reverse!(mask)
+
+            partial_negative_sample_list = partial_negative_sample_list[mask]
+            append!(negative_sample_item, partial_negative_sample_list)
+            partial_negative_sample_size += length(partial_negative_sample_list)
         end
-        reverse!(mask)
 
-        negative_sample = negative_sample[mask]
-        append!(negative_sample_list, negative_sample)
-        negative_sample_size += length(negative_sample)
+        #negative_sample = stack((negative_sample, negative_sample_list[1:data.negative_sample_size]))
+        push!(negative_sample, negative_sample_item[1:data.negative_sample_size])
+        #negative_sample = negative_sample # original: torch.from_numpy
     end
-    negative_sample = stack(negative_sample_list)[1:data.negative_sample_size]
-    negative_sample = negative_sample # original: torch.from_numpy
-    positive_sample = convert.(Float64, [tail])
-
-    return positive_sample, negative_sample, subsampling_weight, flatten(query), (query_structure)
+    positive_sample = convert.(Int, answers)
+    #@info "tail $(tail)"
+    #@info "positive_sample: $(positive_sample)"
+    return positive_sample, negative_sample, subsampling_weight, flatten(query), query_structure
 end
 
 function load_data(args, queries_dict)
