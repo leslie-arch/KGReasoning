@@ -102,11 +102,11 @@ function parse_cmdargs(args::Vector{String})
         arg_type=Int
         help="no need to set manually, will configure automatically"
         "--save_checkpoint_steps"
-        default=50000
+        default=450
         arg_type=Int
         help="save checkpoints every xx steps"
         "--valid_steps"
-        default=10000
+        default=100
         arg_type=Int
         help="evaluate validation queries every xx steps"
         "--log_steps"
@@ -114,7 +114,7 @@ function parse_cmdargs(args::Vector{String})
         arg_type=Int
         help="train log every xx steps"
         "--test_log_steps"
-        default=1000
+        default=100
         arg_type=Int
         help="valid/test log every xx steps"
         "--nentity"
@@ -193,20 +193,13 @@ function set_logger(args)
     end
 end
 
-#="""
-Print the evaluation logs
-"""=#
 function log_metrics(mode, step, metrics)
     for m in metrics
-        @info "$mode $m.first at step $(step): $(m.second)"
+        @info "$mode $(m.first) at step $(step): $(m.second)"
     end
 end
 
-#="""
-Evaluate queries in dataloader
-"""=#
 function evaluate(model, tp_answers, fn_answers, args, dataloader, query_name_dict, mode, step, tblogger)
-
     average_metrics = Dict{Float}()
     all_metrics = Dict{Float}()
 
@@ -263,7 +256,6 @@ function main(cmd_args)
         prefix = args["prefix"]
     end
 
-    @info ("overwritting saving path: $(args["save_path"])")
     args["save_path"] = joinpath(prefix, last(split(args["data_path"], "/")), args["tasks"], args["geo"])
     geo = args["geo"]
     if geo in ["box"]
@@ -283,8 +275,9 @@ function main(cmd_args)
     if ! ispath(args["save_path"])
         mkpath(args["save_path"])
     end
+
     set_logger(args)
-    @info ("logging to $(args["save_path"])")
+    @info ("overwritting saving path: $(args["save_path"])")
     if ! args["train"] # if not training, then create tensorboard files in some tmp location
         tblogger = TBLogger("./$(prefix)/unused-tb")
     else
@@ -379,19 +372,17 @@ function main(cmd_args)
                      eval_tuple(args["beta_mode"]),
                      args["cuda"] == "Yes")
 
-    model = KGModel.KGReasoning(conf)
-    Flux.f64(model)
-    #=
+    model = KGModel.build_KGReasoning(conf)
     @info("Model Parameter Configuration:")
     for (lindex,layer) in enumerate(Flux.params(model)) #.named_parameters()
-        num_params = 0
-        for (pindex, pa) in enumerate(Flux.params(layer))
-            @info("Parameter layer$lindex-$pindex: $(size(pa))")
-            num_params += sum(length, Flux.params(layer))
-        end
-        @info("Parameter Number: $num_params")
+    num_params = 0
+    for (pindex, pa) in enumerate(Flux.params(layer))
+    @info("Parameter layer$lindex-$pindex: $(size(pa))")
+    num_params += sum(length, Flux.params(layer))
     end
-    =#
+    @info("Parameter Number: $num_params")
+    end
+
     if args["cuda"]
         model = model.cuda()
     end
@@ -421,17 +412,8 @@ function main(cmd_args)
     end
 
     step = init_step
-    if args["geo"] == "box"
-        @info("box mode = $(args["box_mode"])")
-    elseif args["geo"] == "beta"
-        @info("beta mode = $(args["beta_mode"])")
-    end
     if args["train"]
-        @info("learning_rate = $current_learning_rate")
-    end
-
-    if args["train"]
-        @info("Start Training init_step: $(init_step)...")
+        @info("Training init_step: $(init_step)...")
         training_logs = []
         # #Training Loop
         local path_data, path_next;
@@ -439,29 +421,29 @@ function main(cmd_args)
         path_data, path_next = iterate(train_path_dataloader)
         other_data, other_next = iterate(train_other_dataloader)
         for step in range(init_step, args["max_steps"])
+            @info("Training step: $(step).......................")
             if step == 2 * floor(args["max_steps"] / 3)
                 args["valid_steps"] *= 4
             end
 
-            log = KGModel.train_step(model, conf, opt_state, path_data, args, step)
+            r_state, r_model, log = KGModel.train_step(model, conf, opt_state, path_data, args, step)
             # data for next step
             path_data, path_next = iterate(train_path_dataloader, path_next)
             for metric in log
                 with_logger(tblogger) do
-                    @info "path_" * "$(metric)" log[metric] = step
+                    @info "Training: path_" * "$(metric)" log[metric] = step
                 end
             end
 
             if train_other_dataloader != nothing
-                log = KGModel.train_step(model, conf, opt_state, other_data, args, step)
+                r_state, r_model, log = KGModel.train_step(model, conf, opt_state, other_data, args, step)
                 other_data, other_next = iterate(train_other_dataloader, other_next)
                 for metric in log
-                    @info "metric : $(metric)"
                     with_logger(tblogger) do
-                        @info "other_" * "$(metric)" log[metric] = step
+                        @info "Training: other_" * "$(metric)" log[metric] = step
                     end
                 end
-                log = KGModel.train_step(model, conf, opt_state, path_data, args, step)
+                r_state, r_model, log = KGModel.train_step(model, conf, opt_state, path_data, args, step)
                 path_data, path_next = iterate(train_path_dataloader, other_next)
             end
 
@@ -469,9 +451,9 @@ function main(cmd_args)
 
             if step >= warn_up_steps
                 current_learning_rate = current_learning_rate / 5
-                @info("Change learning_rate to $(current_learning_rate) at step $(step)")
+                @info("Training Step: Change learning_rate to $(current_learning_rate) at step $(step)")
 
-                opt_state = Flux.setup(Flux.Optimiser.Adam(lr = current_learning_rate), model)
+                opt_state = Flux.setup(Flux.Optimise.Adam(current_learning_rate), model)
                 warn_up_steps = warn_up_steps * 1.5
             end
 
@@ -481,17 +463,19 @@ function main(cmd_args)
                     "current_learning_rate" => current_learning_rate,
                     "warm_up_steps" => warn_up_steps
                 )
-                JLD2.save(joinpath(args["save_path"], "checkpoint-$(step).jld2"),model_state = Flux.state(model), opt = opt_state, variables = save_variable_list, params = args)
+                JLD2.save(joinpath(args["save_path"], "checkpoint-$(step).jld2"),
+                          model_state = Flux.state(model), opt = opt_state,
+                          variables = save_variable_list, params = args)
             end
 
             if step % args["valid_steps"] == 0 && step > 0
-                if args["do_valid"]
+                if args["valid"]
                     @info("Evaluating on Valid Dataset...")
                     valid_all_metrics = evaluate(model, valid_easy_answers, valid_hard_answers, args,
                                                  valid_dataloader, query_name_dict, "Valid", step, tblogger)
                 end
 
-                if args["do_test"]
+                if args["test"]
                     @info("Evaluating on Test Dataset...")
                     test_all_metrics = evaluate(model, test_easy_answers, test_hard_answers, args,
                                                 test_dataloader, query_name_dict, "Test", step, tblogger)
@@ -500,7 +484,7 @@ function main(cmd_args)
 
             if step % args["log_steps"] == 0
                 metrics = Dict()
-                println("main: $(training_logs)")
+                #println("main: $(training_logs)")
                 if(length(training_logs) > 0)
                     for metric in keys(training_logs[1])
                         metrics[metric] = sum([log[metric] for log in training_logs])/length(training_logs)
@@ -516,7 +500,9 @@ function main(cmd_args)
                 "current_learning_rate" => current_learning_rate,
                 "warm_up_steps" => warn_up_steps
             )
-            JLD2.save(joinpath(args["save_path"], "checkpoint-$(step).jld2"),model_state = Flux.state(model), opt = opt_state, variables = save_variable_list, params = args)
+            JLD2.save(joinpath(args["save_path"], "checkpoint-$(step).jld2"),
+                      model_state_dict = Flux.state(model), opt = opt_state,
+                      variables = save_variable_list, params = args)
             =#
         end
         @info("Training finished!!")
@@ -531,11 +517,9 @@ end
 
 if abspath(PROGRAM_FILE) == @__FILE__
     args = Vector{String}(["--train", "--data_path", "dataset/FB15k-betae",
-                           "-n", "32", "-b", "4", "-d", "64", "-g", "24","--learning_rate",
-                           "0.0001", "--max_steps", "450001",
-                           "--cpu", "1", "--geo", "beta", "--valid_steps", "15000"])
-    #structed_args = parse_cmdargs(args);
-    #println(structed_args)
+                           "-n", "128", "-b", "64", "-d", "128", "-g", "24","--learning_rate",
+                           "0.0001", "--max_steps", "4501",
+                           "--cpu", "1", "--geo", "beta", "--valid_steps", "150"])
 
     main(args)
 
