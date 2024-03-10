@@ -998,19 +998,8 @@ function forward_vec(m::KGReasoning, conf::KGRConfig, positive_sample, negative_
 end
 
 function train_step(model::KGReasoning, conf::KGRConfig, opt_state, data, args, step)
-    #opti_stat = Flux.setup(model, optimizer)
-
-    #println("train_step data :: $(data)")
-
-    #Flux.train!(loss, model, data, opt_state)# do model, data
-
-    ########################################################################################################
-    #model.train() # set model as train mode
-    #optimizer.zero_grad() # clear grad, set to zero
     positive_sample, negative_sample, subsampling_weight, queries, query_structures = data
     negative_sample = combinedims(negative_sample)
-    println("train_step: *****************************************************************")
-    #println("$(positive_sample)\n $(negative_sample)\n $(subsampling_weight)\n $(queries)\n $(query_structures)")
 
     batch_queries_dict = Dict{Any, Union{Vector{Vector{Int}}, Matrix{Int}}}()
     batch_idxs_dict = Dict{Any, Vector{Int}}()
@@ -1046,7 +1035,7 @@ function train_step(model::KGReasoning, conf::KGRConfig, opt_state, data, args, 
     #println("train_step: typeof negative_sample: $(typeof(negative_sample))")
 
     for query_structure in keys(batch_queries_dict)
-        println("train_step: query structure $(query_structure)------------------------------------------ooo")
+        #println("train_step: query structure $(query_structure)------------------------------------------ooo")
         if occursin('u', conf.query_name_dict[query_structure]) && occursin("DNF", conf.query_name_dict[query_structure])
             alpha_embeddings, beta_embeddings, _ = embed_query_beta(model, conf,
                                                                     transform_union_query(conf,
