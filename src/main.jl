@@ -102,7 +102,7 @@ function parse_cmdargs(args::Vector{String})
         arg_type=Int
         help="no need to set manually, will configure automatically"
         "--save_checkpoint_steps"
-        default=450
+        default=500
         arg_type=Int
         help="save checkpoints every xx steps"
         "--valid_steps"
@@ -257,12 +257,11 @@ function main(cmd_args)
     end
 
     args["save_path"] = joinpath(prefix, last(split(args["data_path"], "/")), args["tasks"], args["geo"])
-    geo = args["geo"]
-    if geo in ["box"]
+    if args["geo"] == "box"
         save_str = "g-$(args["gamma"])-mode-$(args["box_mode"])"
-    elseif geo in ["vec"]
+    elseif args["geo"] == "vec"
         save_str = "g-$(args["gamma"])"
-    elseif geo == "beta"
+    elseif args["geo"] == "beta"
         save_str = "g-$(args["gamma"])-mode-$(args["beta_mode"])"
     end
 
@@ -375,12 +374,12 @@ function main(cmd_args)
     model = KGModel.build_KGReasoning(conf)
     @info("Model Parameter Configuration:")
     for (lindex,layer) in enumerate(Flux.params(model)) #.named_parameters()
-    num_params = 0
-    for (pindex, pa) in enumerate(Flux.params(layer))
-    @info("Parameter layer$lindex-$pindex: $(size(pa))")
-    num_params += sum(length, Flux.params(layer))
-    end
-    @info("Parameter Number: $num_params")
+        num_params = 0
+        for (pindex, pa) in enumerate(Flux.params(layer))
+            @info("Parameter layer$lindex-$pindex: $(size(pa))")
+            num_params += sum(length, Flux.params(layer))
+        end
+        @info("Parameter Number: $num_params")
     end
 
     if args["cuda"]
@@ -463,8 +462,9 @@ function main(cmd_args)
                     "current_learning_rate" => current_learning_rate,
                     "warm_up_steps" => warn_up_steps
                 )
-                JLD2.save(joinpath(args["save_path"], "checkpoint-$(step).jld2"),
-                          model_state = Flux.state(model), opt = opt_state,
+                println("main: save model at step $(step) to $(joinpath(args["save_path"], "checkpoint-$(step).jld2"))")
+                jldsave(joinpath(args["save_path"], "checkpoint-$(step).jld2"),
+                        model_state = Flux.state(model), opt = opt_state,
                           variables = save_variable_list, params = args)
             end
 
@@ -521,6 +521,6 @@ if abspath(PROGRAM_FILE) == @__FILE__
                            "0.0001", "--max_steps", "4501",
                            "--cpu", "1", "--geo", "beta", "--valid_steps", "150"])
 
-    main(args)
+    main(ARGS)
 
 end

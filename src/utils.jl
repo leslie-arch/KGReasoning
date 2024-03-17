@@ -5,7 +5,8 @@
 #export flatten, format_time, eval_tuple, flatten_query;
 
 function norm_pd(x, p = 2; dims=1)
-    sum(abs.(x) .^ p, dims = dims) .^ (1 / p)
+    norm_x = sum(abs.(x) .^ p, dims = dims) .^ (1 / p)
+    return dropdims(norm_x, dims=dims)
 end
 
 function nest_flatten(arr)
