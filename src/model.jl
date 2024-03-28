@@ -2,21 +2,19 @@
 
 module KGModel
 
-#using Base: offset_if_vec
-#using Zygote: AbstractFFTs
-using Base: batch_size_err_str, substrides
+using Base: offset_if_vec, project_file_name_uuid
+using Random
 using SplitApplyCombine
 
 export Identity, OffsetIntersection, CenterIntersection, BetaIntersection,
     BetaProjection, Regularizer, KGReasoning, KGRConfig, train_step, build_KGReasoning
 
-using Flux;
+using Lux;
+using Optimisers;
 using Zygote;
-#using Statistics;
+using CUDA;
 using Distributions;
 using Distances;
-#using Divergences;
-using KLDivergences;
 using MLUtils;
 
 include("utils.jl")
@@ -24,74 +22,102 @@ include("utils.jl")
 function Identity(x)
     return x;
 end
-#=
-function normDims(x, p::Int = 2; dims = 1)
-    sum(abs.(x) .^ p; dims).^(1 / p)
-end
-=#
-struct OffsetIntersection
-    #dim::Int
-    layer1::Flux.Dense
-    layer2::Flux.Dense
+
+struct Regularizer{T}
+    base_add::T
+    min_val::T
+    max_val::T
 end
 
-OffsetIntersection(dim::Int) = OffsetIntersection(Flux.Dense(dim => dim, init = Flux.glorot_uniform),
-                                                  Flux.Dense(dim => dim, init = Flux.glorot_uniform))
+function (m::Regularizer)(embedding)
+    #clamp is for vector, add [.] to broadcast
+    embedding = clamp.(embedding .+ m.base_add, m.min_val, m.max_val)
+    return embedding
+end
+
+struct OffsetIntersection{L1, L2} <: Lux.AbstractExplicitContainerLayer{(:layer1, :layer2)}
+    layer1::L1
+    layer2::L2
+end
+
+OffsetIntersection(dim::Int) = OffsetIntersection(Lux.Dense(dim => dim, relu),
+                                                  Lux.Dense(dim => dim, sigmoid))
 
 #Function-like Object
-function (m::OffsetIntersection)(embeddings)
-    @show "OffsetIntersection size embeddings $(size(embeddings))"
-    layer1_act = Flux.relu(m.layer1(embeddings))
-    layer1_mean = mean(layer1_act, dims=ndims(layer1_act))
-    layer1_out = dropdims(layer1_mean, dims=ndims(layer1_mean))
-    gate = Flux.sigmoid(m.layer2(layer1_out))
+function (m::OffsetIntersection)(embeddings, ps, st::NamedTuple)
+    x, st_ = Lux.apply(m.layer1, embeddings, getfield(ps, :layer1), getfield(st, :layer1))
+    st = merge(st, NamedTuple{(:layer1,)}((st_,)))
+
+    x_mean = mean(x, dims=ndims(x))
+    y2_in = dropdims(x_mean, dims=ndims(x_mean))
+
+    x, st_ = Lux.apply(m.layer2, y2_in, getfield(ps, :layer2), getfield(st, :layer2))
+    st = merge(st, NamedTuple{(:layer2,)}((st_,)))
+
+    #y1, _ = m.layer1(embeddings, ps.layer1, st.layer1)
+    #y1_mean = mean(y1, dims=ndims(y1))
+    #y2_in = dropdims(y1_mean, dims=ndims(y1_mean))
+    #gate, st = m.layer2(y2_in, ps.layer2, st.layer2)
 
     offset = minimum(embeddings, dims=ndims(embeddings))
-    offset_drop = dropdims(offset, dims=ndims(embeddings))
+    offset_drop = dropdims(offset, dims=ndims(offset))
 
-    return offset_drop .* gate
+    return offset_drop .* x, st
 end
 
-Flux.@functor OffsetIntersection
-
-struct CenterIntersection
-    #dim::Int
-    layer1::Flux.Dense
-    layer2::Flux.Dense
+function Lux.apply(m::OffsetIntersection, embeddings, ps, st)
+    return m(embeddings, ps, st), st
 end
 
-CenterIntersection(dim::Int) = CenterIntersection(Flux.Dense(dim => dim, init = Flux.glorot_uniform),
-                                                  Flux.Dense(dim => dim, init = Flux.glorot_uniform))
+struct CenterIntersection{L1, L2} <: Lux.AbstractExplicitContainerLayer{(:layer1, :layer2)}
+    layer1::L1
+    layer2::L2
+end
 
-function (m::CenterIntersection)(embeddings)
-    layer1_act = Flux.relu(m.layer1(embeddings)) # ( dim, num_conj)
-    layer2_out = m.layer2(layer1_act)
-    attention = Flux.softmax(layer2_out, dims=ndims(layer2_out)) # (dim, num_conj, )
-    println("CenterIntersection: size attention $(size(attention)) size embedding $(size(embeddings))")
+#CenterIntersection(dim::Int) = CenterIntersection(Lux.Dense(dim => dim, relu),
+#                                                  Lux.Dense(dim => dim, softmax))
 
-    att_embeddings = attention .* embeddings
+CenterIntersection(dim::Int) = CenterIntersection(Lux.Dense(dim => dim, relu),
+                                                  Lux.Dense(dim => dim))
+function (m::CenterIntersection)(embeddings, ps, st)
+    #y1, _ = m.layer1(embeddings, ps.layer1, st.layer1)
+    #att, st = m.layer2(y1, ps.layer2, st.layer2)
+    #attention = Lux.softmax(y2, dims=ndims(y2)) # (dim, num_conj, )
+
+    y, st_ = Lux.apply(m.layer1, embeddings, getfield(ps, :layer1), getfield(st, :layer1))
+    st = merge(st, NamedTuple{(:layer1,)}((st_,)))
+
+    y2, st_ = Lux.apply(m.layer2, y, getfield(ps, :layer2), getfield(st, :layer2))
+    st = merge(st, NamedTuple{(:layer2,)}((st_,)))
+    attention = Lux.softmax(y2, dims=ndims(y2)) # (dim, num_conj, )
+
+    att_embeddings = att .* embeddings
     embedding = sum(att_embeddings, dims=ndims(att_embeddings))
 
-    return dropdims(embedding, dims=ndims(embedding))
+    return dropdims(embedding, dims=ndims(embedding)), st
 end
 
-Flux.@functor CenterIntersection
-
-struct BetaIntersection
-    layer1::Flux.Dense
-    layer2::Flux.Dense
+function Lux.apply(m::CenterIntersection, embeddings, ps, st)
+    return m(embeddings,ps, st), st
 end
 
-BetaIntersection(dim::Int) = BetaIntersection(Flux.Dense(2 * dim => 2 * dim, init = Flux.glorot_uniform),
-                                              Flux.Dense(2 * dim => dim, init = Flux.glorot_uniform))
+struct BetaIntersection{L1, L2} <: Lux.AbstractExplicitContainerLayer{(:layer1, :layer2)}
+    layer1::L1
+    layer2::L2
+end
 
-function (m::BetaIntersection)(alpha_embeddings, beta_embeddings)
+#BetaIntersection(dim::Int) = BetaIntersection(Lux.Dense(2 * dim => 2 * dim, relu),
+#                                              Lux.Dense(2 * dim => dim, softmax))
+
+BetaIntersection(dim::Int) = BetaIntersection(Lux.Dense(2 * dim => 2 * dim, relu),
+                                              Lux.Dense(2 * dim => dim))
+function (m::BetaIntersection)(alpha_embeddings, beta_embeddings, ps, st)
     #println("BetaIntersection: size alpha $(size(alpha_embeddings)), beta $(size(beta_embeddings))")
     all_embeddings = cat(alpha_embeddings, beta_embeddings, dims = 1)
     #println("BetaIntersection: size all $(size(all_embeddings))")
-    layer1_relu = Flux.relu(m.layer1(all_embeddings))
-    layer2_out = m.layer2(layer1_relu)
-    attention = Flux.softmax(layer2_out, dims=ndims(layer2_out))
+    y1, _ = m.layer1(all_embeddings, ps.layer1, st.layer1)
+    y2, st = m.layer2(y1, ps.layer2, st.layer2)
+    attention = Lux.softmax(y2, dims=ndims(y2))
 
     #println("BetaIntersection: size attention $(size(attention))")
     alpha_embedding = dropdims(sum(attention .* alpha_embeddings, dims=ndims(alpha_embeddings)),
@@ -100,88 +126,165 @@ function (m::BetaIntersection)(alpha_embeddings, beta_embeddings)
                               dims=ndims(beta_embeddings))
 
     #println("BetaIntersection: size alpha $(size(alpha_embedding)) beta $(size(beta_embedding))")
-    return alpha_embedding, beta_embedding
+    return alpha_embedding, beta_embedding, st
 end
 
-Flux.@functor BetaIntersection
-
-struct Regularizer
-    base_add::AbstractFloat
-    min_val::AbstractFloat
-    max_val::AbstractFloat
+function Lux.apply(m::BetaIntersection, alpha_embeddings, beta_embeddings, ps, st)
+    return m(alpha_embeddings, beta_embeddings, ps, st)
 end
 
-function (m::Regularizer)(entity_embedding)
-    #println("Regularizer: embedding size [$(size(entity_embedding))]")
-    #println("Regularizer: $(m.base_add) $(m.min_val) $(m.max_val)")
-    #println("Regularizer: min max $(minimum(entity_embedding)) $(maximum(entity_embedding))")
-    #clamp is for vector, add [.] to broadcast
-    embedding = clamp.(entity_embedding .+ m.base_add, m.min_val, m.max_val)
-    #println("Regularizer: clamp min max $(minimum(embedding)) $(maximum(embedding))")
-    return embedding
+struct BetaProjection{L, C} <: Lux.AbstractExplicitContainerLayer{(:layer0, :layers)}
+    layer0::L
+    layers::C
+    regularizer::Regularizer
 end
 
-#Flux.@functor Regularizer
+function BetaProjection(entity_dim, relation_dim, hidden_dim, num_layers, regularizer)
+    layer0  = Lux.Dense(hidden_dim => entity_dim, relu)
 
-struct BetaProjection
-    layers::Dict{Symbol, Flux.Dense}
-    projection_regularizer
-end
-
-function Base.setproperty!(m::BetaProjection, property::Symbol, value)
-    if property == :layers || property == :projection_regularizer
-        setfield(m, property, value)
-    else
-        getfield(m, :layers)[property] = value
-    end
-end
-
-function Base.getproperty(m::BetaProjection, property::Symbol)
-    if property == :layers || property == :projection_regularizer
-        return getfield(m, property)
-    else
-        return getfield(m, :layers)[property]
-    end
-end
-
-function Base.propertynames(m::BetaProjection, private = false)
-    return keys(getproperty(m, :layers))
-end
-
-function BetaProjection(entity_dim, relation_dim, hidden_dim, num_layers, projection_regularizer, init=Flux.glorot_uniform)
-    layers = Dict{Symbol, Flux.Dense}()
-    layers[:layer1] = Flux.f64(Flux.Dense((entity_dim + relation_dim) => hidden_dim, init = init))
-    layers[:layer0]  = Flux.f64(Flux.Dense(hidden_dim => entity_dim, init = init))
-    for nl in range(2, num_layers)
-        layers[Symbol("layer$(nl)")] = Flux.f64(Flux.Dense(hidden_dim => hidden_dim, init = init))
+    layers = Vector()
+    push!(layers, Lux.Dense((entity_dim + relation_dim) => hidden_dim, relu))
+    for l in range(2, num_layers)
+        push!(layers, Lux.Dense(hidden_dim => hidden_dim, relu))
     end
 
-    @eval Flux.trainable(m::BetaProjection) = (values(m.layers))
+    clayers = Lux.Chain(layers)
 
-    return BetaProjection(layers, projection_regularizer)
+    return BetaProjection(layer0, clayers, regularizer)
 end
 
-function (m::BetaProjection)(e_embedding, r_embedding)
+function (m::BetaProjection)(e_embedding, r_embedding, ps, st)
     x = cat(e_embedding, r_embedding, dims=1)
 
-    for n in range(1,length(m.layers) - 1)
-        x = Flux.relu(getproperty(m, Symbol("layer$(n)"))(x))
-    end
-    x = getproperty(m, :layer0)(x)
-    x = m.projection_regularizer(x)
+    y_s, st_ = m.layers(x, ps.layers, st.layers)
+    st = merge(st, NamedTuple{(:layers,)}((st_,)))
+    #println("BetaProjection: size chain  $(size(y_s))")
 
-    return x
+    #y_0, st_layer0 = m.layer0(y_s, ps.layer0, st.layer0)
+    y, st_ = Lux.apply(m.layer0, y_s, getfield(ps, :layer0), getfield(st, :layer0))
+    st = merge(st, NamedTuple{(:layer0,)}((st_,)))
+    #println("BetaProjection: type layer0 $(size(y_0))")
+    y = m.regularizer(y)
+
+    return y, st
 end
 
-Flux.@functor BetaProjection
+function Lux.apply(m::BetaProjection, e_embedding, r_embedding, ps, st)
+    y, st = m(e_embedding, r_embedding, ps, st)
 
-Base.@kwdef struct KGRConfig
+    return y, st
+end
+
+#Base.@kwdef struct KGRConfig
+#    nentity::Integer
+#    nrelation::Integer
+#    geo::String
+#    cuda::Bool
+#
+#    batch_entity_range
+#
+#    gamma::AbstractFloat
+#    epsilon::AbstractFloat
+#    hidden_dim::Integer
+#    entity_dim::Integer
+#    relation_dim::Integer
+#    query_name_dict::Dict{Tuple, String}
+#
+#    ######################################
+#    box_activation::Union{Function, Missing} = missing
+#    box_center::Union{Float64, Missing} = missing
+#
+#    beta_hidden_dim::Integer
+#    beta_num_layers::Integer
+#    beta_entity_regularizer::Union{Regularizer, Missing} = missing
+#    beta_projection_regularizer::Union{Regularizer, Missing} = missing
+#end
+
+#function KGRConfig(nentity, nrelation, hidden_dim, gamma, query_name_dict, geo,
+#                   box_mode=nothing, beta_mode=nothing,  cuda = false, batch = 1)
+#    epsilon = 2.0
+#    entity_dim = hidden_dim
+#    relation_dim = hidden_dim
+#    batch_entity_range = repeat(convert.(Float32, range(0, nentity - 1)), 1, batch)
+#
+#    local box_activation = missing
+#    activation, box_center = box_mode
+#    local beta_hidden_dim, beta_num_layers = (0, 0)
+#    beta_entity_regularizer, beta_projection_regularizer = (missing, missing)
+#
+#    if geo == "box"
+#        if activation == nothing
+#            box_activation = Identity;
+#        elseif activation == "relu"
+#            box_activation = Lux.relu;
+#        elseif activation == "softplus"
+#            box_activation = Lux.softplus;
+#        end
+#    elseif geo == "beta"
+#        beta_hidden_dim, beta_num_layers = beta_mode
+#        #println("KGRConfig: beta_mode $(beta_mode) beta_hidden: $(beta_hidden_dim) num_layers: $(beta_num_layers)")
+#        # make sure the parameters of beta embeddings are positive
+#        beta_entity_regularizer = Regularizer(1, 0.05, 1e9)
+#        # make sure the parameters of beta embeddings after relation projection are positive
+#        beta_projection_regularizer = Regularizer(1, 0.05, 1e9)
+#        #println("KGRConfig: regularizer: $(beta_entity_regularizer)")
+#        #println("KGRConfig: regularizer: $(beta_projection_regularizer)")
+#    end
+#    #println("box_mode: activation: $(activation) - $(box_activation) center: $(box_center)")
+#    return KGRConfig(nentity, nrelation, geo, cuda,
+#                     batch_entity_range,
+#                     gamma, epsilon,
+#                     hidden_dim, entity_dim, relation_dim,
+#                     query_name_dict,
+#                     box_activation, box_center,
+#                     beta_hidden_dim, beta_num_layers,
+#                     beta_entity_regularizer,
+#                     beta_projection_regularizer)
+#end
+abstract type BatchData end
+
+struct  BetaBatchData <: BatchData
+    positive_sample
+    negative_sample
+    subsampling_weight
+
+    all_idxs
+    all_alpha_embeddings
+    all_beta_embeddings
+    all_union_idxs
+    all_union_alpha_embeddings
+    all_union_beta_embeddings
+end
+
+struct  BoxBatchData <: BatchData
+    positive_sample
+    negative_sample
+    subsampling_weight
+    all_idxs
+    all_center_embeddings
+    all_offset_embeddings
+    all_union_idxs
+    all_union_center_embeddings
+    all_union_offset_embeddings
+end
+
+struct VecBatchData <: BatchData
+    positive_sample
+    negative_sample
+    subsampling_weight
+    all_idxs
+    all_center_embeddings
+    all_union_idxs
+    all_union_center_embeddings
+end
+
+struct KGReasoning  <: Lux.AbstractExplicitLayer
     nentity::Int
     nrelation::Int
     geo::String
-    use_cuda::Bool
+    cuda::Bool
 
-    batch_entity_range #TODO type and initialize
+    batch_entity_range
 
     gamma::AbstractFloat
     epsilon::AbstractFloat
@@ -191,17 +294,33 @@ Base.@kwdef struct KGRConfig
     query_name_dict::Dict{Tuple, String}
 
     ######################################
-    box_activation::Union{Function, Missing} = missing
-    box_center::Union{Float64, Missing} = missing
+    box_activation::Union{Function, Missing}
+    box_center::Union{Float64, Missing}
 
     beta_hidden_dim::Int
     beta_num_layers::Int
-    beta_entity_regularizer::Union{Regularizer, Missing} = missing
-    beta_projection_regularizer::Union{Regularizer, Missing} = missing
+    beta_entity_regularizer::Union{Regularizer, Missing}
+    beta_projection_regularizer::Union{Regularizer, Missing}
+
+    center_net::Union{Lux.AbstractExplicitContainerLayer, Missing}
+    offset_net::Union{Lux.AbstractExplicitContainerLayer, Missing}
+    projection_net::Union{Lux.AbstractExplicitContainerLayer, Missing}
+    #init_weight::Function
+    #gamma::Vector{T}
+    #
+    #embedding_range::Vector{T}
+    #
+    #entity_embedding::Matrix{T}
+    #relation_embedding::Matrix{T}
+    #offset_embedding::Union{Missing, Matrix{T}} = missing
+    #
+    #center_net::Union{BetaIntersection, CenterIntersection, Missing} = missing
+    #offset_net::Union{OffsetIntersection, Missing} = missing
+    #projection_net::Union{BetaProjection, Missing} = missing
 end
 
-function KGRConfig(nentity, nrelation, hidden_dim, gamma, query_name_dict, geo,
-                   box_mode=nothing, beta_mode=nothing,  cuda = false, batch = 1)
+function KGReasoning(nentity, nrelation, hidden_dim, gamma, query_name_dict, geo,
+                     box_mode=nothing, beta_mode=nothing,  cuda = false, batch = 1)
     epsilon = 2.0
     entity_dim = hidden_dim
     relation_dim = hidden_dim
@@ -212,126 +331,226 @@ function KGRConfig(nentity, nrelation, hidden_dim, gamma, query_name_dict, geo,
     local beta_hidden_dim, beta_num_layers = (0, 0)
     beta_entity_regularizer, beta_projection_regularizer = (missing, missing)
 
-    println("KGRConfig: activation $(activation)")
     if geo == "box"
         if activation == nothing
             box_activation = Identity;
         elseif activation == "relu"
-            box_activation = Flux.relu;
+            box_activation = Lux.relu;
         elseif activation == "softplus"
-            box_activation = Flux.softplus;
+            box_activation = Lux.softplus;
         end
     elseif geo == "beta"
         beta_hidden_dim, beta_num_layers = beta_mode
-        #println("KGRConfig: beta_mode $(beta_mode) beta_hidden: $(beta_hidden_dim) num_layers: $(beta_num_layers)")
+
         # make sure the parameters of beta embeddings are positive
-        beta_entity_regularizer = Regularizer(1, 0.05, 1e9)
-        # make sure the parameters of beta embeddings after relation projection are positive
-        beta_projection_regularizer = Regularizer(1, 0.05, 1e9)
-        #println("KGRConfig: regularizer: $(beta_entity_regularizer)")
-        #println("KGRConfig: regularizer: $(beta_projection_regularizer)")
+        beta_entity_regularizer = Regularizer(1f0, 0.05f0, 1f9)
+        beta_projection_regularizer = Regularizer(1f0, 0.05f0, 1f9)
     end
+
+    offset_net, projection_net = missing, missing
+    if geo == "box"
+        center_net = CenterIntersection(entity_dim)
+        offset_net = OffsetIntersection(entity_dim)
+    elseif geo == "vec"
+        center_net = CenterIntersection(entity_dim)
+    elseif geo == "beta"
+        center_net = BetaIntersection(entity_dim)
+        projection_net = BetaProjection(entity_dim * 2,
+                                        relation_dim,
+                                        beta_hidden_dim,
+                                        beta_num_layers,
+                                        beta_projection_regularizer)
+    end
+
     #println("box_mode: activation: $(activation) - $(box_activation) center: $(box_center)")
-    return KGRConfig(nentity, nrelation, geo, cuda,
-                     batch_entity_range,
-                     gamma, epsilon,
-                     hidden_dim, entity_dim, relation_dim,
-                     query_name_dict,
-                     box_activation, box_center,
-                     beta_hidden_dim, beta_num_layers,
-                     beta_entity_regularizer,
-                     beta_projection_regularizer)
+    return KGReasoning(nentity, nrelation, geo, cuda,
+                       batch_entity_range,
+                       gamma, epsilon,
+                       hidden_dim, entity_dim, relation_dim,
+                       query_name_dict,
+                       box_activation,
+                       box_center,
+                       beta_hidden_dim,
+                       beta_num_layers,
+                       beta_entity_regularizer,
+                       beta_projection_regularizer,
+                       center_net,
+                       offset_net,
+                       projection_net)
 end
 
-Base.@kwdef struct KGReasoning
-    gamma::Vector{Float64}
+function Lux.initialparameters(rng::AbstractRNG, m::KGReasoning)
 
-    embedding_range::Vector{Float64}
-
-    entity_embedding::Matrix{Float64}
-    relation_embedding::Matrix{Float64}
-    offset_embedding::Union{Missing, Matrix{Float64}} = missing
-
-    center_net::Union{BetaIntersection, CenterIntersection, Missing} = missing
-    offset_net::Union{OffsetIntersection, Missing} = missing
-    projection_net::Union{BetaProjection, Missing} = missing
-end
-
-Flux.@functor KGReasoning
-
-function build_KGReasoning(conf, init = Flux.glorot_uniform)
-    gamma = [conf.gamma]
-    embedding_range = (gamma .+ conf.epsilon) ./ conf.hidden_dim
     #println("embedding_range: $(embedding_range) type: $(typeof(embedding_range)) gamma $(gamma) $(typeof(gamma))")
     local entity_embedding
-    if conf.geo == "box"
-        entity_embedding = init(conf.entity_dim, conf.nentity) # centor for entities
+    if m.geo == "box"
+        entity_embedding = Lux.glorot_uniform(rng, m.entity_dim, m.nentity) # centor for entities
         #entity_embedding = init(conf.nentity, conf.entity_dim)
-    elseif conf.geo == "vec"
-        entity_embedding = init(conf.entity_dim, conf.nentity)
+    elseif m.geo == "vec"
+        entity_embedding = Lux.glorot_uniform(rng, m.entity_dim, m.nentity)
         #entity_embedding = init(conf.nentity, conf.entity_dim)
-    elseif conf.geo == "beta"
+    elseif m.geo == "beta"
         #entity_embedding = init(conf.nentity, conf.entity_dim * 2)
-        entity_embedding = init(conf.entity_dim * 2, conf.nentity)
+        entity_embedding = Lux.glorot_uniform(rng, m.entity_dim * 2, m.nentity)
     end
 
-    relation_embedding = init(conf.relation_dim, conf.nrelation)
+    relation_embedding = Lux.glorot_uniform(rng, m.relation_dim, m.nrelation)
 
-    local offset_embedding, center_net, offset_net, projection_net = Vector{Missing}(undef, 4)
-    if conf.geo == "box"
-        offset_embedding = init(conf.entity_dim, conf.nrelation)
-        println("offset_embedding: $(typeof(offset_embedding))")
+    #local offset_embedding, center_net, offset_net, projection_net = Vector{Missing}(undef, 4)
+    if m.geo == "box"
+        offset_embedding = Lux.glorot_uniform(rng, m.entity_dim, m.nrelation)
 
-        center_net = CenterIntersection(conf.entity_dim)
-        offset_net = OffsetIntersection(conf.entity_dim)
-    elseif conf.geo == "vec"
-        center_net = CenterIntersection(conf.entity_dim)
-    elseif conf.geo == "beta"
-        center_net = BetaIntersection(conf.entity_dim)
-        projection_net = BetaProjection(conf.entity_dim * 2,
-                                        conf.relation_dim,
-                                        conf.beta_hidden_dim,
-                                        conf.beta_num_layers,
-                                        conf.beta_projection_regularizer)
+        center_net, c_st = Lux.setup(rng, m.center_net)
+        offset_net, o_st = Lux.setup(rng, m.offset_net)
+        ps =  (gamma = m.gamma,
+               #embedding_range = (m.gamma .+ m.epsilon) ./ m.hidden_dim,
+               entity_embedding = entity_embedding,
+               relation_embedding = relation_embedding,
+               offset_embedding = offset_embedding,
+               center_net = center_net,
+               offset_net = offset_net)
+
+    elseif m.geo == "vec"
+        center_net, c_st = Lux.setup(rng, m.center_net)
+        ps =  (gamma = m.gamma,
+               #embedding_range = (m.gamma .+ m.epsilon) ./ m.hidden_dim,
+               entity_embedding = entity_embedding,
+               relation_embedding = relation_embedding,
+               center_net = center_net)
+
+    elseif m.geo == "beta"
+        center_net, c_st = Lux.setup(rng, m.center_net)
+        projection_net, p_st = Lux.setup(rng, m.projection_net)
+
+        ps =  (gamma = m.gamma,
+               #embedding_range = (m.gamma .+ m.epsilon) ./ m.hidden_dim,
+               entity_embedding = entity_embedding,
+               relation_embedding = relation_embedding,
+               center_net = center_net,
+               projection_net = projection_net)
     end
 
-    model =  KGReasoning(gamma, embedding_range,
-                         entity_embedding, relation_embedding, offset_embedding,
-                         center_net, offset_net, projection_net);
-    return model
+    return ps
 end
 
-function (m::KGReasoning)(conf::KGRConfig, positive_sample, negative_sample, subsampling_weight,
-                          batch_distribution_args...)
+function Lux.initialstates(rng::AbstractRNG, m::KGReasoning)
+    if m.geo == "box"
+        center_net, c_st = Lux.setup(rng, m.center_net)
+        offset_net, o_st = Lux.setup(rng, m.offset_net)
 
-    println("KGReasoning: geo $(conf.geo)")
-    if conf.geo == "beta"
-        all_idxs, all_alpha_embeddings, all_beta_embeddings,
-        all_union_idxs, all_union_alpha_embeddings, all_union_beta_embeddings = batch_distribution_args
+        st =  (center_net = c_st,
+               offset_net = o_st)
+    elseif m.geo == "vec"
+        center_net, c_st = Lux.setup(rng, m.center_net)
 
-        return forward_beta(m, conf, positive_sample, negative_sample, subsampling_weight,
-                            all_idxs, all_alpha_embeddings, all_beta_embeddings,
-                            all_union_idxs, all_union_alpha_embeddings, all_union_beta_embeddings)
-    elseif conf.geo == "box"
-        all_idxs, all_center_embeddings, all_offset_embeddings,
-        all_union_idxs, all_union_center_embeddings, all_union_offset_embeddings = batch_distribution_args
+        st =  (center_net = c_st)
+    elseif m.geo == "beta"
+        center_net, c_st = Lux.setup(rng, m.center_net)
+        projection_net, p_st = Lux.setup(rng, m.projection_net)
 
-        return forward_box(m, conf, positive_sample, negative_sample, subsampling_weight,
-                           all_idxs, all_center_embeddings, all_offset_embeddings,
-                           all_union_idxs, all_union_center_embeddings, all_union_offset_embeddings)
-    elseif conf.geo == "vec"
-        all_idxs, all_center_embeddings, all_union_idxs, all_union_center_embeddings = batch_distribution_args
-
-        return forward_vec(m, conf, positive_sample, negative_sample, subsampling_weight,
-                           all_idxs, all_center_embeddings, all_union_idxs, all_union_center_embeddings)
+        st =  (center_net = c_st,
+               projection_net = p_st)
     end
+
+    return st
+end
+
+#function build_KGReasoning(conf::KGRConfig)
+#    gamma = [conf.gamma]
+#    embedding_range = (gamma .+ conf.epsilon) ./ conf.hidden_dim
+#    #println("embedding_range: $(embedding_range) type: $(typeof(embedding_range)) gamma $(gamma) $(typeof(gamma))")
+#    local entity_embedding
+#    if conf.geo == "box"
+#        entity_embedding = init(conf.entity_dim, conf.nentity) # centor for entities
+#        #entity_embedding = init(conf.nentity, conf.entity_dim)
+#    elseif conf.geo == "vec"
+#        entity_embedding = init(conf.entity_dim, conf.nentity)
+#        #entity_embedding = init(conf.nentity, conf.entity_dim)
+#    elseif conf.geo == "beta"
+#        #entity_embedding = init(conf.nentity, conf.entity_dim * 2)
+#        entity_embedding = init(conf.entity_dim * 2, conf.nentity)
+#    end
+#
+#    relation_embedding = init(conf.relation_dim, conf.nrelation)
+#
+#    local offset_embedding, center_net, offset_net, projection_net = Vector{Missing}(undef, 4)
+#    if conf.geo == "box"
+#        offset_embedding = init(conf.entity_dim, conf.nrelation)
+#
+#        center_net = CenterIntersection(conf.entity_dim)
+#        offset_net = OffsetIntersection(conf.entity_dim)
+#    elseif conf.geo == "vec"
+#        center_net = CenterIntersection(conf.entity_dim)
+#    elseif conf.geo == "beta"
+#        center_net = build_BetaIntersection(conf.entity_dim, cuda = conf.cuda)
+#        projection_net = build_BetaProjection(conf.entity_dim * 2,
+#                                              conf.relation_dim,
+#                                              conf.beta_hidden_dim,
+#                                              conf.beta_num_layers,
+#                                              conf.beta_projection_regularizer)
+#    end
+#
+#    if conf.cuda
+#        gamma = gpu(gamma)
+#        embedding_range = embedding_range |> gpu
+#        entity_embedding = entity_embedding |> gpu
+#        relation_embedding = relation_embedding |> gpu
+#        offset_embedding = offset_embedding |> gpu
+#        center_net = center_net |> gpu
+#        offset_net = offset_net |> gpu
+#        projection_net = projection_net |> gpu
+#    end
+#    model =  KGReasoning(gamma, embedding_range,
+#                         entity_embedding, relation_embedding, offset_embedding,
+#                         center_net, offset_net, projection_net)
+#    return model
+#end
+
+function (m::KGReasoning)(data::BatchData, ps, st)
+
+    if m.geo == "beta"
+        return forward_beta(m, ps, st,
+                            data.positive_sample,
+                            data.negative_sample,
+                            data.subsampling_weight,
+                            data.all_idxs,
+                            data.all_alpha_embeddings,
+                            data.all_beta_embeddings,
+                            data.all_union_idxs,
+                            data.all_union_alpha_embeddings,
+                            data.all_union_beta_embeddings)
+    elseif m.geo == "box"
+        return forward_box(m, ps, st,
+                           data.positive_sample,
+                           data.negative_sample,
+                           data.subsampling_weight,
+                           data.all_idxs,
+                           data.all_center_embeddings,
+                           data.all_offset_embeddings,
+                           data.all_union_idxs,
+                           data.all_union_center_embeddings,
+                           data.all_union_offset_embeddings)
+    elseif m.geo == "vec"
+        return forward_vec(m, ps, st,
+                           data.positive_sample,
+                           data.negative_sample,
+                           data.subsampling_weight,
+                           data.all_idxs,
+                           data.all_center_embeddings,
+                           data.all_union_idxs,
+                           data.all_union_center_embeddings)
+    end
+end
+
+function  Lux.apply(m::KGReasoning, data::BetaBatchData, ps, st)
+    return m(data, ps, st)
 end
 
 ####
 # embed a batch of queries with same structure using Query2box
 # queries: a flattened batch of queries
 ####
-function embed_query_box(m::KGReasoning, conf::KGRConfig, queries, query_structure, idx)
+function embed_query_box(m::KGReasoning, ps, st, queries, query_structure, idx)
 
     all_relation_flag = true
      # whether the current query tree has mfferged to one branch and only need to do relation traversal,
@@ -345,33 +564,38 @@ function embed_query_box(m::KGReasoning, conf::KGRConfig, queries, query_structu
 
     if all_relation_flag
         if query_structure[1] == "e"
-            embedding = selectdim(m.entity_embedding,
-                                  ndims(m.entity_embedding),
+            embedding = selectdim(ps.entity_embedding,
+                                  ndims(ps.entity_embedding),
                                   queries[idx, :] .+ 1)
             #embedding = torch.index_select(m.entity_embedding, dim=0, index=queries[:, idx])
             offset_embedding = zeros(size(embedding))
-            if conf.use_cuda
+            if m.cuda
+                embedding = embedding |> gpu
                 offset_embedding = zeros(size(embedding)) .|> gpu
             end
             idx += 1
         else
-            embedding, offset_embedding, idx = embed_query_box(m, conf, queries, query_structure[1], idx)
+            embedding, offset_embedding, idx = embed_query_box(m, ps, st, queries, query_structure[1], idx)
         end
 
         for i in range(1, length(last(query_structure)))
             if last(query_structure)[i] == "n"
                 @assert false "box cannot handle queries with negation"
             else
-                r_embedding = selectdim(m.relation_embedding,
-                                        ndims(m.relation_embedding),
+                r_embedding = selectdim(ps.relation_embedding,
+                                        ndims(ps.relation_embedding),
                                         queries[idx, :] .+ 1)
                 #r_embedding = torch.index_select(self.relation_embedding, dim=0, index=queries[:, idx])
-                r_offset_embedding = selectdim(m.offset_embedding,
-                                               ndims(m.offset_embedding),
+                r_offset_embedding = selectdim(ps.offset_embedding,
+                                               ndims(ps.offset_embedding),
                                                queries[idx, :] .+ 1)
                 #r_offset_embedding = torch.index_select(self.offset_embedding, dim=0, index=queries[:, idx])
+                if m.cuda
+                    r_embedding = r_embedding |> gpu
+                    r_offset_embedding = r_offset_embedding |> gpu
+                end
                 embedding .+= r_embedding
-                offset_embedding .+= conf.box_activation(r_offset_embedding)
+                offset_embedding .+= m.box_activation(r_offset_embedding)
             end
             idx += 1
         end
@@ -379,12 +603,17 @@ function embed_query_box(m::KGReasoning, conf::KGRConfig, queries, query_structu
         embedding_list = []
         offset_embedding_list = []
         for i in range(1, length(query_structure))
-            embedding, offset_embedding, idx = embed_query_box(m, conf, queries, query_structure[i], idx)
+            embedding, offset_embedding, idx = embed_query_box(m, ps, st, queries, query_structure[i], idx)
             push!(embedding_list, embedding)
             push!(offset_embedding_list, offset_embedding)
         end
-        embedding = m.center_net(stack(embedding_list))
-        offset_embedding = m.offset_net(stack(offset_embedding_list))
+        if m.cuda
+            embedding = ps.center_net(stack(embedding_list) |> gpu)
+            offset_embedding = ps.offset_net(stack(offset_embedding_list) |> gpu)
+        else
+            embedding = ps.center_net(stack(embedding_list), ps.center_net, st)
+            offset_embedding = ps.offset_net(stack(offset_embedding_list), ps.center_net, st)
+        end
     end
     return embedding, offset_embedding, idx
 end
@@ -443,8 +672,7 @@ Iterative embed a batch of queries with same structure using BetaE
 queries: a flattened batch of queries
 * all the queries have the same structure(entitie and relation indexes)
 =#
-function embed_query_beta(m::KGReasoning, conf::KGRConfig, queries, query_structure, idx)
-
+function embed_query_beta(m::KGReasoning, ps, st, queries, query_structure, idx)
     all_relation_flag = true
     # whether the current query tree has merged to one branch and only need to do relation traversal,
     # e.g., path queries or conjunctive queries after the intersection
@@ -454,9 +682,7 @@ function embed_query_beta(m::KGReasoning, conf::KGRConfig, queries, query_struct
             break
         end
     end
-    #println("embed_query_beta: $(query_structure) last $(last(query_structure)) all_relation: $(all_relation_flag)")
-    #println("embed_query_beta: queries $(queries)")
-    #println("embed_query_beta: typeof queries $(typeof(queries)) idx $(idx)")
+
     #================
     ('e',('r',)): '1p',
     ('e', ('r', 'r')): '2p',
@@ -470,13 +696,17 @@ function embed_query_beta(m::KGReasoning, conf::KGRConfig, queries, query_struct
     if all_relation_flag
         # the first element is whether an "e"[entity] or ("e" , ...)[sub question]
         if query_structure[1] == "e"
-            embeddings = copy(selectdim(m.entity_embedding,
-                                        ndims(m.entity_embedding),
-                                        queries[idx, :] .+ 1))
-            embeddings = conf.beta_entity_regularizer(embeddings)
+            embeddings = selectdim(ps.entity_embedding,
+                                   ndims(ps.entity_embedding),
+                                   queries[idx, :] .+ 1)
+
+            if m.cuda
+                embeddings = embeddings |> gpu
+            end
+            embeddings = m.beta_entity_regularizer(embeddings)
             idx += 1
         else
-            alpha_embedding, beta_embedding, idx = embed_query_beta(m, conf, queries, query_structure[1], idx)
+            alpha_embedding, beta_embedding, idx = embed_query_beta(m, ps, st, queries, query_structure[1], idx)
             embeddings = cat(alpha_embedding, beta_embedding, dims=1)
         end
 
@@ -488,10 +718,16 @@ function embed_query_beta(m::KGReasoning, conf::KGRConfig, queries, query_struct
                 @assert all(x -> x == -2, queries[idx, :])
                 embeddings = 1 ./ embeddings
             else
-                r_embeddings = copy(selectdim(m.relation_embedding,
-                                              ndims(m.relation_embedding),
-                                              queries[idx, :] .+ 1))
-                embeddings = m.projection_net(embeddings, r_embeddings)
+                r_embeddings = selectdim(ps.relation_embedding,
+                                         ndims(ps.relation_embedding),
+                                         queries[idx, :] .+ 1)
+
+                if m.cuda
+                    r_embeddings = r_embeddings |> gpu
+                end
+                #embeddings = m.projection_net(embeddings, r_embeddings, ps.projection_net, st.projection_net)
+                embeddings, st_ = m.projection_net(embeddings, r_embeddings, ps.projection_net, st.projection_net)
+                st = merge(st, NamedTuple{(:projection_net,)}((st_,)))
             end
             idx += 1
         end
@@ -511,28 +747,34 @@ function embed_query_beta(m::KGReasoning, conf::KGRConfig, queries, query_struct
         alpha_embedding_list = []
         beta_embedding_list = []
         for i in range(1, length(query_structure))
-            alpha_embedding, beta_embedding, idx = embed_query_beta(m, conf, queries, query_structure[i], idx)
+            alpha_embedding, beta_embedding, idx = embed_query_beta(m, ps, st, queries, query_structure[i], idx)
             push!(alpha_embedding_list, alpha_embedding)
             push!(beta_embedding_list, beta_embedding)
         end
-        alpha_embedding, beta_embedding = m.center_net(stack(alpha_embedding_list), stack(beta_embedding_list))
+        if m.cuda
+            alpha_embedding, beta_embedding = m.center_net(stack(alpha_embedding_list) |> gpu, stack(beta_embedding_list) |> gpu)
+        else
+            alpha_embedding, beta_embedding, st_ = m.center_net(stack(alpha_embedding_list), stack(beta_embedding_list),
+                                                           ps.center_net, st.center_net)
+            st = merge(st, NamedTuple{(:center_net, )}((st_,)))
+        end
     end
 
     return alpha_embedding, beta_embedding, idx
 end
 
 #============================================
-    transform 2u queries to two 1p queries
-    transform up queries to two 2p queries
+transform 2u queries to two 1p queries
+transform up queries to two 2p queries
 ============================================#
-function transform_union_query(conf::KGRConfig, queries, query_structure)
+function transform_union_query(m::KGReasoning, queries, query_structure)
 
-    if conf.query_name_dict[query_structure] == "2u-DNF"
+    if m.query_name_dict[query_structure] == "2u-DNF"
         #=
         (('e', ('r',)), ('e', ('r',)), ('u',)) => (('e', ('r',)), ('e', ('r',)))
         =#
         queries = queries[1:(size(queries, 1) - 1, :)] # remove union -1
-    elseif conf.query_name_dict[query_structure] == "up-DNF"
+    elseif m.query_name_dict[query_structure] == "up-DNF"
         #=
         ((('e', ('r',)), ('e', ('r',)), ('u',)), ('r',)) => ((e, (r, r)), (e, (r, r)))
         =#
@@ -542,10 +784,10 @@ function transform_union_query(conf::KGRConfig, queries, query_structure)
     return queries
 end
 
-function transform_union_structure(conf::KGRConfig, query_structure)
-    if conf.query_name_dict[query_structure] == "2u-DNF"
+function transform_union_structure(m::KGReasoning, query_structure)
+    if m.query_name_dict[query_structure] == "2u-DNF"
         return ("e", ("r",))
-    elseif conf.query_name_dict[query_structure] == "up-DNF"
+    elseif m.query_name_dict[query_structure] == "up-DNF"
         return ("e", ("r", "r"))
     end
 end
@@ -554,27 +796,23 @@ function logit_beta(m::KGReasoning, entity_embedding, query_dist)
     ##########################TODO#######################################
     alpha_embedding, beta_embedding = chunk(entity_embedding, 2, dims = 1)
     entity_dist = Distributions.Beta.(alpha_embedding, beta_embedding)
-    #println("logit_beta: alpha_embedding $(size(alpha_embedding))")
-    #println("logit_beta: beta_embedding $(size(beta_embedding))")
-    #println("logit_beta: beta_embedding $(size(entity_dist))")
-    kld = KLDivergences.KL.(entity_dist, query_dist)
-    #println("logit_beta: kld $(size(kld)))")
-    logit = m.gamma .- norm_pd(KLDivergences.KL.(entity_dist, query_dist), 1, dims=1)
+    kld = Distributions.kldivergence.(entity_dist, query_dist)
+
+    logit = m.gamma .- norm_pd(Distributions.kldivergence.(entity_dist, query_dist), 1, dims=1)
     return logit
 end
 
-function forward_beta(m::KGReasoning, conf::KGRConfig,
+function forward_beta(m::KGReasoning, ps, st,
                       positive_sample, negative_sample, subsampling_weight,
                       all_idxs, all_alpha_embeddings, all_beta_embeddings,
                       all_union_idxs, all_union_alpha_embeddings, all_union_beta_embeddings)
-
     if length(all_alpha_embeddings) > 0
-        #println("forward_beta: all_x_embedding: $(size(all_alpha_embeddings)) -- $(size(all_beta_embeddings))")
         all_alpha_embeddings = reduce(hcat, all_alpha_embeddings)
-        all_alpha_embeddings= Flux.unsqueeze(all_alpha_embeddings, ndims(all_alpha_embeddings))
+
+        all_alpha_embeddings= MLUtils.unsqueeze(all_alpha_embeddings, ndims(all_alpha_embeddings))
 
         all_beta_embeddings = reduce(hcat, all_beta_embeddings)
-        all_beta_embeddings= Flux.unsqueeze(all_beta_embeddings, ndims(all_beta_embeddings))
+        all_beta_embeddings= MLUtils.unsqueeze(all_beta_embeddings, ndims(all_beta_embeddings))
         #println("forward_beta: all_x_embedding: $(size(all_alpha_embeddings)) -- $(size(all_beta_embeddings))")
 
         all_dists = Distributions.Beta.(all_alpha_embeddings, all_beta_embeddings)
@@ -583,11 +821,11 @@ function forward_beta(m::KGReasoning, conf::KGRConfig,
     if length(all_union_alpha_embeddings) > 0
         #all_union_alpha_embeddings = torch.cat(all_union_alpha_embeddings, dim=0).unsqueeze(1)
         #all_union_beta_embeddings = torch.cat(all_union_beta_embeddings, dim=0).unsqueeze(1)
-        all_union_alpha_embeddings = reduce(hcat, all_union_alpha_embeddings)
-        all_union_alpha_embeddings = Flux.unsqueeze(all_union_alpha_embeddings, ndims(all_union_alpha_embeddings))
+        #all_union_alpha_embeddings = reduce(hcat, all_union_alpha_embeddings)
+        all_union_alpha_embeddings = MLUtils.unsqueeze(all_union_alpha_embeddings, ndims(all_union_alpha_embeddings))
 
         all_union_beta_embeddings = reduce(hcat, all_union_beta_embeddings)
-        all_union_beta_embeddings = Flux.unsqueeze(all_union_beta_embeddings, ndims(all_union_beta_embeddings))
+        all_union_beta_embeddings = MLUtils.unsqueeze(all_union_beta_embeddings, ndims(all_union_beta_embeddings))
 
         all_union_alpha_embeddings = reshape(all_union_alpha_embeddings, :, 1, 2,
                                              div(size(all_union_alpha_embeddings, ndims(all_union_alpha_embeddings)), 2))
@@ -608,16 +846,22 @@ function forward_beta(m::KGReasoning, conf::KGRConfig,
     local positive_logit, positive_alpha_logit, positive_union_logit
     if typeof(positive_sample) != typeof(nothing)
         if length(all_alpha_embeddings) > 0
-            positive_sample_regular = positive_sample[all_idxs] # positive samples for non-union queries in this batch
+            positive_regular = positive_sample[all_idxs] # positive samples for non-union queries in this batch
             #println("forward_beta: positive_sample_regular idxs: $(all_idxs)")
-            #println("forward_beta: positive_sample_regular positive_sample_regular $(positive_sample_regular)")
-            entity_embedding_select = selectdim(m.entity_embedding,
-                                                ndims(m.entity_embedding),
-                                                positive_sample_regular .+ 1);
-            entity_embedding_unsqueeze = Flux.unsqueeze(entity_embedding_select, ndims(entity_embedding_select))
+            #println("forward_beta: positive_sample_regular positive_regular $(positive_regular)")
+            idxs_bias = ones(Integer, size(positive_regular))
+            positive_idxs = positive_regular + idxs_bias
+            entity_embedding_select = ps.entity_embedding[:, positive_idxs]
+            #                                    ndims(m.entity_embedding),
+            #                                    idxs_bias);
+            #entity_embedding_select = selectdim(ps.entity_embedding,
+            #                                    ndims(ps.entity_embedding),
+            #                                    positive_idxs)
+
+            entity_embedding_unsqueeze = MLUtils.unsqueeze(entity_embedding_select, ndims(entity_embedding_select))
             #println("entity_embedding: $(size(entity_embedding_select)) - $(size(entity_embedding_unsqueeze))")
 
-            positive_embedding = conf.beta_entity_regularizer(entity_embedding_unsqueeze)
+            positive_embedding = m.beta_entity_regularizer(entity_embedding_unsqueeze)
             positive_alpha_logit = logit_beta(m, positive_embedding, all_dists)
         else
             positive_alpha_logit = []
@@ -625,14 +869,16 @@ function forward_beta(m::KGReasoning, conf::KGRConfig,
         #println("forward_beta: size positive_logit $(size(positive_alpha_logit))")
 
         if length(all_union_alpha_embeddings) > 0
-            positive_sample_union = positive_sample[all_union_idxs] # positive samples for union queries in this batch
+            positive_union = positive_sample[all_union_idxs] # positive samples for union queries in this batch
 
-            entity_embedding_select = selectdim(m.entity_embedding,
-                                                ndims(m.entity_embedding),
-                                                positive_sample_union .+ 1);
-            entity_embedding_select_unsqueeze = Flux.unsqueeze(entity_embedding_select,
-                                                               dims=ndims(entity_embedding_select));
-            positive_embedding = conf.beta_entity_regularizer(entity_embedding_select_unsqueeze)
+            idxs_bias = ones(Integer, size(positive_regular))
+            positive_union_idxs = positive_union + idxs_bias
+            entity_embedding_select = selectdim(ps.entity_embedding,
+                                                ndims(ps.entity_embedding),
+                                                positive_union_idxs)
+
+            entity_embedding_select_unsqueeze = MLUtils.unsqueeze(entity_embedding_select, ndims(entity_embedding_select))
+            positive_embedding = m.beta_entity_regularizer(entity_embedding_select_unsqueeze)
             positive_union_logit = logit_beta(m, positive_embedding, all_union_dists)
             #println("forward_beta: size positive_union_logit $(size(positive_union_logit))")
             positive_union_logit = maximum(positive_union_logit, dims=1)[1]
@@ -656,19 +902,21 @@ function forward_beta(m::KGReasoning, conf::KGRConfig,
     if typeof(negative_sample) != typeof(nothing)
         if length(all_alpha_embeddings) > 0
             #println("forward_beta: size all_idxs $(all_idxs)\n size negative_sample $(size(negative_sample))")
-            negative_sample_regular = negative_sample[:, all_idxs]
+            negative_regular = negative_sample[:, all_idxs]
             #println("forward_beta: size negative_sample_regular $(size(negative_sample_regular))")
-            negative_size, batch_size = size(negative_sample_regular)
+            negative_size, batch_size = size(negative_regular)
 
-            negative_regular_reshape = reshape(negative_sample_regular, :)
+            negative_regular_reshape = reshape(negative_regular, :)
             #println("forward_beta: max min negative sample : $(maximum(negative_regular_reshape)) $(minimum(negative_regular_reshape))")
-            negative_regular_select = selectdim(m.entity_embedding,
-                                                ndims(m.entity_embedding),
-                                                negative_regular_reshape .+ 1)
+            idxs_bias = ones(Integer, length(negative_regular_reshape))
+            negative_idxs = negative_regular_reshape + idxs_bias
+            negative_regular_select = selectdim(ps.entity_embedding,
+                                                ndims(ps.entity_embedding),
+                                                negative_idxs)
             #println("forward_beta: negative regular size $(size(negative_regular_select))")
             negative_regular_reshape = reshape(negative_regular_select, :, negative_size, batch_size)
             #println("forward_beta: negative regular reshape size $(size(negative_regular_reshape))")
-            negative_embedding = conf.beta_entity_regularizer(negative_regular_reshape)
+            negative_embedding = m.beta_entity_regularizer(negative_regular_reshape)
 
             negative_alpha_logit = logit_beta(m, negative_embedding, all_dists)
         else
@@ -682,13 +930,13 @@ function forward_beta(m::KGReasoning, conf::KGRConfig,
 
             negative_union_reshape = reshape(negative_sample_union, :)
             #println("forward_beta: max min negative sample : $(maximum(negative_union_reshape)) $(minimum(negative_union_reshape))")
-            negative_union_select = selectdim(m.entity_embedding,
-                                              ndims(m.entity_embedding),
+            negative_union_select = selectdim(ps.entity_embedding,
+                                              ndims(ps.entity_embedding),
                                               negative_union_reshape .+ 1)
             #println("forward_beta: negative union size $(size(negative_union_select))")
             negative_union_reshape = reshape(negative_union_select, :, negative_size, batch_size)
             #println("forward_beta: negative union reshape size $(size(negative_union_reshape))")
-            negative_embedding = conf.beta_entity_regularizer(negative_union_reshape)
+            negative_embedding = m.beta_entity_regularizer(negative_union_reshape)
             negative_union_logit = logit_beta(m, negative_embedding, all_union_dists)
             #println("forward_beta: negative union logit size $(size(negative_union_logit))")
             negative_union_logit = maximum(negative_union_logit, dims=1)[1]
@@ -708,14 +956,14 @@ function forward_beta(m::KGReasoning, conf::KGRConfig,
         negative_logit = nothing
     end
 
-    return positive_logit, negative_logit, subsampling_weight, [all_idxs, all_union_idxs]
+    return (positive_logit, negative_logit, subsampling_weight, [all_idxs, all_union_idxs]), st
 end
 
-function logit_box(m::KGReasoning, conf::KGRConfig, entity_embedding, query_center_embedding, query_offset_embedding)
+function logit_box(m::KGReasoning, entity_embedding, query_center_embedding, query_offset_embedding)
 
     #println("logit_box: embedding size entity $(size(entity_embedding)) query_center $(size(query_center_embedding)) query_offset $(size(query_offset_embedding))")
     delta = abs.(entity_embedding .- query_center_embedding)
-    distance_out = Flux.relu(delta .- query_offset_embedding)
+    distance_out = Lux.relu(delta .- query_offset_embedding)
     #println("logit_box: size delta $(size(delta)) distance_out $(size(distance_out))")
     distance_in = min.(delta, query_offset_embedding)
 
@@ -723,24 +971,24 @@ function logit_box(m::KGReasoning, conf::KGRConfig, entity_embedding, query_cent
     norm_distance_in = norm_pd(distance_in, 1, dims=1)
     #println("logit_box:  size distance $(size(norm_distance_out)) $(size(norm_distance_in))")
     #logit = m.gamma .- dropdims(norm_distance_out, dims=1) .- conf.box_center .* dropdims(norm_distance_in, dims=1)
-    logit = m.gamma .- norm_distance_out .- conf.box_center .* norm_distance_in
+    logit = m.gamma .- norm_distance_out .- m.box_center .* norm_distance_in
     return logit
 end
 
-function forward_box(m::KGReasoning, conf::KGRConfig, positive_sample, negative_sample, subsampling_weight,
+function forward_box(m::KGReasoning, ps, st, positive_sample, negative_sample, subsampling_weight,
                      all_idxs, all_center_embeddings, all_offset_embeddings,
                      all_union_idxs, all_union_center_embeddings, all_union_offset_embeddings)
 
     if length(all_center_embeddings) > 0 && length(all_offset_embeddings) > 0
         all_center_embeddings_cat = reduce(hcat, all_center_embeddings)
         #println("forward_box: size all_center_embeddings $(size(all_center_embeddings)) $(size(all_center_embeddings_cat))")
-        all_center_embeddings = unsqueeze(all_center_embeddings_cat,
-                                          dims = ndims(all_center_embeddings_cat))
+        all_center_embeddings = MLUtils.unsqueeze(all_center_embeddings_cat,
+                                                  dims = ndims(all_center_embeddings_cat))
 
         all_offset_embeddings_cat = reduce(hcat, all_offset_embeddings)
         #println("forward_box: size all_offset_embeddings $(size(all_offset_embeddings)) $(size(all_offset_embeddings_cat))")
-        all_offset_embeddings = unsqueeze(all_offset_embeddings_cat,
-                                          dims = ndims(all_offset_embeddings_cat))
+        all_offset_embeddings = MLUtils.unsqueeze(all_offset_embeddings_cat,
+                                                  dims = ndims(all_offset_embeddings_cat))
         #all_offset_embeddings = torch.cat(all_offset_embeddings, dim=0).unsqueeze(1)
     end
 
@@ -749,13 +997,13 @@ function forward_box(m::KGReasoning, conf::KGRConfig, positive_sample, negative_
         #all_union_offset_embeddings = torch.cat(all_union_offset_embeddings, dim=0).unsqueeze(1)
         all_union_center_embeddings_cat = reduce(hcat, all_union_center_embeddings)
         #println("forward_box: size all_union_center_embeddings $(size(all_union_center_embeddings)) $(size(all_union_center_embeddings_cat))")
-        all_union_center_embeddings = unsqueeze(all_union_center_embeddings_cat,
-                                                dims = ndims(all_union_center_embeddings_cat))
+        all_union_center_embeddings = MLUtils.unsqueeze(all_union_center_embeddings_cat,
+                                                        dims = ndims(all_union_center_embeddings_cat))
 
         all_union_offset_embeddings_cat = reduce(hcat, all_union_offset_embeddings)
         #println("forward_box: size all_union_offset_embeddings $(size(all_union_offset_embeddings)) $(size(all_union_offset_embeddings_cat))")
-        all_union_offset_embeddings = unsqueeze(all_union_offset_embeddings_cat,
-                                                dims = ndims(all_union_offset_embeddings_cat))
+        all_union_offset_embeddings = MLUtils.unsqueeze(all_union_offset_embeddings_cat,
+                                                        dims = ndims(all_union_offset_embeddings_cat))
         #println("forward_box: size all_union_embeddings $(size(all_union_center_embeddings)) $(size(all_union_offset_embeddings))")
         #all_union_center_embeddings = all_union_center_embeddings.view(all_union_center_embeddings.shape[0]//2, 2, 1, -1)
         #all_union_offset_embeddings = all_union_offset_embeddings.view(all_union_offset_embeddings.shape[0]//2, 2, 1, -1)
@@ -776,9 +1024,9 @@ function forward_box(m::KGReasoning, conf::KGRConfig, positive_sample, negative_
                                                 ndims(m.entity_embedding),
                                                 positive_sample_regular .+ 1)
 
-            positive_embedding = unsqueeze(entity_embedding_select, ndims(entity_embedding_select))
+            positive_embedding = MLUtils.unsqueeze(entity_embedding_select, ndims(entity_embedding_select))
             #println("forward_box: size  embedding entity $(size(entity_embedding_select)) positive $(size(positive_embedding))")
-            positive_logit = logit_box(m, conf,
+            positive_logit = logit_box(m,
                                        positive_embedding,
                                        all_center_embeddings,
                                        all_offset_embeddings)
@@ -793,13 +1041,14 @@ function forward_box(m::KGReasoning, conf::KGRConfig, positive_sample, negative_
             entity_embedding_select = selectdim(m.entity_embedding,
                                                 ndims(m.entity_embedding),
                                                 positive_sample_union .+ 1)
-            entity_embedding_select_unquezze = unsqueeze(entity_embedding_select, ndims(entity_embedding_select))
-            positive_embedding = unsqueeze(entity_embedding_select_unquezze, ndims(entity_embedding_select_unquezze))
+            entity_embedding_select_unquezze = MLUtils.unsqueeze(entity_embedding_select, ndims(entity_embedding_select))
+            positive_embedding = MLUtils.unsqueeze(entity_embedding_select_unquezze, ndims(entity_embedding_select_unquezze))
 
-            positive_union_logit = logit_box(m, conf, positive_embedding,
+            positive_union_logit = logit_box(m,
+                                             positive_embedding,
                                              all_union_center_embeddings,
                                              all_union_offset_embeddings)
-            positive_union_logit = maximum(positive_union_logit, dims=ndims(positive_union_logit))[1]
+            positive_union_logit = dropdims(maximum(positive_union_logit, dims=1), dims=1)
         else
             #positive_union_logit = torch.Tensor([]).to(self.entity_embedding.device)
             positive_union_logit = [] .|> gpu
@@ -827,7 +1076,7 @@ function forward_box(m::KGReasoning, conf::KGRConfig, positive_sample, negative_
                                                 ndims(m.entity_embedding),
                                                 negative_sample_reshape .+ 1)
             negative_embedding = reshape(entity_embedding_select, :, negative_size, batch_size)
-            negative_logit = logit_box(m, conf,
+            negative_logit = logit_box(m,
                                        negative_embedding,
                                        all_center_embeddings,
                                        all_offset_embeddings)
@@ -846,12 +1095,12 @@ function forward_box(m::KGReasoning, conf::KGRConfig, positive_sample, negative_
                                                 ndims(m.entity_embedding),
                                                 negative_union_reshape .+ 1)
             negative_embedding = reshape(entity_embedding_select, :, negative_size, 1, batch_size)
-            negative_union_logit = logit_box(m, conf,
+            negative_union_logit = logit_box(m,
                                              negative_embedding,
                                              all_union_center_embeddings,
                                              all_union_offset_embeddings)
             #println("forward_box: size negative_union_logit $size(negative_union_logit)")
-            negative_union_logit = maximum(negative_union_logit, dims=ndims(negative_union_logit))[1]
+            negative_union_logit = dropdims(maximum(negative_union_logit, dims=1), dims=1)
         else
             #negative_union_logit = torch.Tensor([]).to(self.entity_embedding.device)
             negative_union_logit = [] .|> gpu
@@ -878,20 +1127,20 @@ function logit_vec(m::KGReasoning, entity_embedding, query_embedding)
     return logit
 end
 
-function forward_vec(m::KGReasoning, conf::KGRConfig, positive_sample, negative_sample, subsampling_weight,
+function forward_vec(m::KGReasoning, ps, st, positive_sample, negative_sample, subsampling_weight,
                      all_idxs, all_center_embeddings, all_union_idxs, all_union_center_embeddings)
 
     if length(all_center_embeddings) > 0
         all_center_embeddings_cat = reduce(hcat, all_center_embeddings)
-        all_center_embeddings = unsqueeze(all_center_embeddings_cat,
-                                          ndims(all_center_embeddings_cat))
+        all_center_embeddings = MLUtils.unsqueeze(all_center_embeddings_cat,
+                                                  ndims(all_center_embeddings_cat))
     end
 
     if length(all_union_center_embeddings) > 0
         all_union_center_embeddings_cat = reduce(hcat, all_union_center_embeddings)
 
-        all_union_center_embeddings_unsqueeze = unsqueeze(all_union_center_embeddings_cat,
-                                                          ndims(all_union_center_embeddings_cat))
+        all_union_center_embeddings_unsqueeze = MLUtils.unsqueeze(all_union_center_embeddings_cat,
+                                                                  ndims(all_union_center_embeddings_cat))
         #all_union_center_embeddings = torch.cat(all_union_center_embeddings, dim=0).unsqueeze(1)
         all_union_center_embeddings = reshape(all_union_center_embeddings_unsqueeze,
                                               :, 1, 2, div(last(size(all_union_center_embeddings)), 2))
@@ -907,7 +1156,7 @@ function forward_vec(m::KGReasoning, conf::KGRConfig, positive_sample, negative_
             positive_embedding_select = selectdim(m.entity_embedding,
                                                   ndims(m.entity_embedding),
                                                   positive_sample_regular .+ 1)
-            positive_embedding = unsqueeze(positive_embedding_select, ndims(positive_embedding_select))
+            positive_embedding = MLUtils.unsqueeze(positive_embedding_select, ndims(positive_embedding_select))
             positive_logit = logit_vec(m, positive_embedding, all_center_embeddings)
         else
             positive_logit = [] .|> gpu
@@ -918,7 +1167,7 @@ function forward_vec(m::KGReasoning, conf::KGRConfig, positive_sample, negative_
             positive_embedding_select = selectdim(m.entity_embedding,
                                                   ndims(m.entity_embedding),
                                                   positive_sample_regular.+ 1)
-            positive_embedding_unsqueeze = unsqueeze(positive_embedding_select, ndims(positive_embedding_select))
+            positive_embedding_unsqueeze = MLUtils.unsqueeze(positive_embedding_select, ndims(positive_embedding_select))
             positive_embedding = unsqueeze(positive_embedding_unsqueeze, ndims(positive_embedding_unsqueeze))
 
             positive_union_logit = logit_vec(m, positive_embedding, all_union_center_embeddings)
@@ -966,7 +1215,7 @@ function forward_vec(m::KGReasoning, conf::KGRConfig, positive_sample, negative_
                                                 negative_union_reshape .+ 1)
             negative_embedding = reshape(entity_embedding_select, :, negative_size, 1, batch_size)
             negative_union_logit = logit_vec(m, negative_embedding, all_union_center_embeddings)
-            negative_union_logit = maximum(negative_union_logit, dim=1)[1]
+            negative_union_logit = dropdims(maximum(negative_union_logit, dims=1), dims=1)
         else
             negative_union_logit = [] .|> gpu
         end
@@ -988,28 +1237,7 @@ function forward_vec(m::KGReasoning, conf::KGRConfig, positive_sample, negative_
     return positive_logit, negative_logit, subsampling_weight, [all_idxs; all_union_idxs]
 end
 
-function loss(positive_logit, negative_logit, subsampling_weight)
-
-    #println("train_step: positive_logit $(positive_logit)")
-    #println("train_step: negative_logit $(negative_logit)")
-    #println("train_step: subsampling_weight $(subsampling_weight)")
-    negative_logsigmoid = Flux.logsigmoid(-negative_logit)
-    negative_score = mean(negative_logsigmoid, dims=ndims(negative_logsigmoid) - 1)
-    negative_score = dropdims(negative_score, dims = ndims(negative_score) - 1)
-
-    positive_logsigmoid =Flux.logsigmoid(positive_logit)
-    positive_score = dropdims(positive_logsigmoid, dims=ndims(positive_logsigmoid) - 1)
-
-    positive_sample_loss = - sum(subsampling_weight * positive_score)
-    negative_sample_loss = - sum(subsampling_weight * negative_score)
-
-    positive_sample_loss /= sum(subsampling_weight)
-    negative_sample_loss /= sum(subsampling_weight)
-
-    return loss = (positive_sample_loss + negative_sample_loss)/2
-end
-
-function train_step(model::KGReasoning, conf::KGRConfig, opt_state, data, args, step)
+function train_step(m::KGReasoning, data, ps, st, opt_state)
 
     positive_sample, negative_sample, subsampling_weight, queries, query_structures = data
     negative_sample = combinedims(negative_sample)
@@ -1027,15 +1255,15 @@ function train_step(model::KGReasoning, conf::KGRConfig, opt_state, data, args, 
     #@info "train_step: queries_dict $(batch_queries_dict)"
     #@info "train_step: idxs_dict $(batch_idxs_dict)"
 
-    if args["cuda"]
-        positive_sample = positive_sample |> gpu
-        negative_sample = negative_sample |> gpu
+    if m.cuda
+        #       positive_sample = positive_sample |> gpu
+        #       negative_sample = negative_sample |> gpu
         subsampling_weight = subsampling_weight |> gpu
     end
 
     local positive_sample_loss, negative_sample_loss, loss
     local positive_logit, negative_logit, subsampling_weight
-    if conf.geo == "beta"
+    if m.geo == "beta"
         all_idxs = Array{Int, 1}()
         all_alpha_embeddings = Array{Matrix{Float64}, 1}()
         all_beta_embeddings = Array{Matrix{Float64}, 1}()
@@ -1049,19 +1277,19 @@ function train_step(model::KGReasoning, conf::KGRConfig, opt_state, data, args, 
 
         for query_structure in keys(batch_queries_dict)
             #println("train_step: query structure $(query_structure)------------------------------------------ooo")
-            if occursin('u', conf.query_name_dict[query_structure]) && occursin("DNF", conf.query_name_dict[query_structure])
-                alpha_embeddings, beta_embeddings, _ = embed_query_beta(model, conf,
-                                                                        transform_union_query(conf,
+            if occursin('u', m.query_name_dict[query_structure]) && occursin("DNF", m.query_name_dict[query_structure])
+                alpha_embeddings, beta_embeddings, _ = embed_query_beta(m, ps, st,
+                                                                        transform_union_query(m,
                                                                                               batch_queries_dict[query_structure],
                                                                                               query_structure),
-                                                                        transform_union_structure(conf, query_structure),
+                                                                        transform_union_structure(m, query_structure),
                                                                         1)
                 append!(all_union_idxs, batch_idxs_dict[query_structure])
                 #all_union_idxs.extend(batch_idxs_dict[query_structure])
                 push!(all_union_alpha_embeddings, alpha_embeddings)
                 push!(all_union_beta_embeddings, beta_embeddings)
             else
-                alpha_embeddings, beta_embeddings, _ = embed_query_beta(model, conf,
+                alpha_embeddings, beta_embeddings, _ = embed_query_beta(m, ps, st,
                                                                         batch_queries_dict[query_structure],
                                                                         query_structure,
                                                                         1)
@@ -1075,12 +1303,21 @@ function train_step(model::KGReasoning, conf::KGRConfig, opt_state, data, args, 
             end
         end
 
-        positive_logit, negative_logit,
-        subsampling_weight, _ = model(conf, positive_sample, negative_sample, subsampling_weight,
-                                      all_idxs, all_alpha_embeddings, all_beta_embeddings,
-                                      all_union_idxs, all_union_alpha_embeddings, all_union_beta_embeddings)
+        if m.cuda
+            all_idxs = all_idxs |> gpu
+            all_alpha_embeddings = all_alpha_embeddings |> gpu
+            all_beta_embeddings = all_beta_embeddings |> gpu
 
-    elseif conf.geo == "box"
+            all_union_idxs = all_union_idxs |> gpu
+            all_union_alpha_embeddings = all_union_alpha_embeddings |> gpu
+            all_union_beta_embeddings = all_union_beta_embeddings |> gpu
+        end
+
+        batch_data = BetaBatchData(positive_sample, negative_sample, subsampling_weight,
+                                   all_idxs, all_alpha_embeddings, all_beta_embeddings,
+                                  all_union_idxs, all_union_alpha_embeddings, all_union_beta_embeddings)
+
+    elseif m.geo == "box"
         all_idxs = Array{Int, 1}()
         all_center_embeddings = Array{Matrix{Float64}, 1}()
         all_offset_embeddings = Array{Matrix{Float64}, 1}()
@@ -1090,39 +1327,44 @@ function train_step(model::KGReasoning, conf::KGRConfig, opt_state, data, args, 
         all_union_offset_embeddings = Array{Matrix{Float64}, 1}()
 
         for query_structure in keys(batch_queries_dict)
-            println("train_step: query_structure $(query_structure) $(conf.query_name_dict[query_structure])")
-            if occursin('u', conf.query_name_dict[query_structure])
-                center_embedding, offset_embedding, _ = embed_query_box(model, conf,
-                                                                        transform_union_query(conf,
+            if occursin('u', m.query_name_dict[query_structure])
+                center_embedding, offset_embedding, _ = embed_query_box(m,
+                                                                        transform_union_query(m,
                                                                                               batch_queries_dict[query_structure],
                                                                                               query_structure),
-                                                                        transform_union_structure(conf, query_structure),
+                                                                        transform_union_structure(m, query_structure),
                                                                         1)
-                println("train_step: size query_box u embedding $(size(center_embedding)) $(size(offset_embedding))")
-                println("train_step: size query_box u embedding $(typeof(center_embedding)) $(typeof(offset_embedding))")
 
                 append!(all_union_idxs, batch_idxs_dict[query_structure])
                 push!(all_union_center_embeddings, center_embedding)
                 push!(all_union_offset_embeddings, offset_embedding)
             else
-                center_embedding, offset_embedding, _ = embed_query_box(model, conf,
+                center_embedding, offset_embedding, _ = embed_query_box(m,
                                                                         batch_queries_dict[query_structure],
                                                                         query_structure,
                                                                         1)
-                println("train_step: size query_box embedding $(size(center_embedding)) $(size(offset_embedding))")
-                println("train_step: size query_box embedding $(typeof(center_embedding)) $(typeof(offset_embedding))")
 
-                append!(all_idxs, batch_idxs_dict[query_structure])
-                push!(all_center_embeddings, center_embedding)
-                push!(all_offset_embeddings, offset_embedding)
+                   append!(all_idxs, batch_idxs_dict[query_structure])
+                   push!(all_center_embeddings, center_embedding)
+                   push!(all_offset_embeddings, offset_embedding)
             end
         end
 
-        positive_logit, negative_logit,
-        subsampling_weight, _ = model(conf, positive_sample, negative_sample, subsampling_weight,
-                                      all_idxs, all_center_embeddings, all_offset_embeddings,
-                                      all_union_idxs, all_union_center_embeddings, all_union_offset_embeddings)
-    elseif conf.geo == "vec"
+        if m.cuda
+            all_idxs = all_idxs |> gpu
+            all_center_embeddings = cu(all_center_embeddings)
+            all_offset_embeddings = cu(all_offset_embeddings)
+
+            all_union_idxs = cu(all_union_idxs)
+            all_union_center_embeddings = cu(all_union_center_embeddings)
+            all_union_offset_embeddings = cu(all_union_offset_embeddings)
+        end
+
+        batch_data = BoxBatchData(positive_sample, negative_sample, subsampling_weight,
+                            all_idxs, all_center_embeddings, all_offset_embeddings,
+                            all_union_idxs, all_union_center_embeddings, all_union_offset_embeddings)
+
+    elseif m.geo == "vec"
         all_idxs = Array{Int, 1}()
         all_center_embeddings = Array{Matrix{Float64}, 1}()
 
@@ -1130,55 +1372,77 @@ function train_step(model::KGReasoning, conf::KGRConfig, opt_state, data, args, 
         all_union_center_embeddings = Array{Matrix{Float64}, 1}()
 
         for query_structure in keys(batch_queries_dict)
-            if occursin('u', conf.query_name_dict[query_structure])
-                center_embedding, _ = embed_query_vec(model, transform_union_query(conf,
-                                                                                   batch_queries_dict[query_structure],
-                                                                                   query_structure),
-                                                      transform_union_structure(conf, query_structure),
+            if occursin('u', m.query_name_dict[query_structure])
+                center_embedding, _ = embed_query_vec(m,
+                                                      transform_union_query(m,
+                                                                            batch_queries_dict[query_structure],
+                                                                            query_structure),
+                                                      transform_union_structure(query_structure),
                                                       1)
 
                 append!(all_union_idxs, batch_idxs_dict[query_structure])
                 push!(all_union_center_embeddings, center_embedding)
             else
-                center_embedding, _ = embed_query_vec(model, batch_queries_dict[query_structure], query_structure, 1)
+                center_embedding, _ = embed_query_vec(m, batch_queries_dict[query_structure], query_structure, 1)
 
                 append!(all_idxs, batch_idxs_dict[query_structure])
                 push!(all_center_embeddings, center_embedding)
             end
         end
 
-        positive_logit, negative_logit,
-        subsampling_weight, _ = model(conf, positive_sample, negative_sample, subsampling_weight,
-                                      all_idxs, all_center_embeddings,
-                                      all_union_idxs, all_union_center_embeddings)
+        if m.cuda
+            all_idxs = cu(all_idxs)
+            all_center_embeddings = cu(all_center_embeddings)
+
+            all_union_idxs = cu(all_union_idxs)
+            all_union_center_embeddings = cu(all_union_center_embeddings)
+        end
+
+
+        batch_data = VecBatchData(positive_sample, negative_sample, subsampling_weight,
+                            all_idxs, all_center_embeddings,
+                            all_union_idxs, all_union_center_embeddings)
     end
 
-    println("train_step: logit size $(size(positive_logit)) $(size(negative_logit)) $(size(subsampling_weight))")
-    opt_grads = Flux.gradient(model, positive_logit, negative_logit,
-                              subsampling_weight) do m, x, y, z
-                                  positive_logsigmoid =Flux.logsigmoid(x)
-                                  positive_score = dropdims(positive_logsigmoid, dims=ndims(positive_logsigmoid) - 1)
+    #positive_logit, negative_logit, subsampling_weight
+    loss, back = Zygote.pullback(m, batch_data) do m, data
 
-                                  negative_logsigmoid = Flux.logsigmoid(-y)
-                                  negative_score = mean(negative_logsigmoid, dims=ndims(negative_logsigmoid) - 1)
-                                  negative_score = dropdims(negative_score, dims = ndims(negative_score) - 1)
+        #println("train_step: pullback ps $(keys(ps))")
+        (positive_logit, negative_logit, subsampling_weight, idxs), st = Lux.apply(m, data, ps, st)
+        #println("train_step: + pullback ps $(keys(ps))")
 
-                                  positive_sample_loss = - sum(z .* positive_score)
-                                  negative_sample_loss = - sum(z .* negative_score)
+        positive_logsigmoid =Lux.logsigmoid(positive_logit)
+        #println("Gradient: size x $(size(x)) $(size(positive_logsigmoid))")
+        positive_score = dropdims(positive_logsigmoid, dims=ndims(positive_logsigmoid) - 1)
 
-                                  positive_sample_loss /= sum(z)
-                                  negative_sample_loss /= sum(z)
+        negative_logsigmoid = Lux.logsigmoid(-negative_logit)
+        #println("Gradient: size y $(size(y)) $(size(negative_logsigmoid))")
+        negative_score = mean(negative_logsigmoid, dims=ndims(negative_logsigmoid) - 1)
+        negative_score = dropdims(negative_score, dims = ndims(negative_score) - 1)
 
-                                  loss = (positive_sample_loss + negative_sample_loss)/2
-                              end
-    r_state, r_model = Flux.update!(opt_state, model, opt_grads[1])
+        positive_sample_loss = - sum(subsampling_weight .* positive_score)
+        negative_sample_loss = - sum(subsampling_weight .* negative_score)
+
+        positive_sample_loss /= sum(subsampling_weight)
+        negative_sample_loss /= sum(subsampling_weight)
+
+        loss = (positive_sample_loss + negative_sample_loss)/2
+    end
+
+    ▿params, xxxxx = back(one(loss))
+
+    #println("train_step ps $(keys(ps))")
+    #println("train_step opt_state $(typeof(opt_state)) $(keys(opt_state))")
+    #println("train_step ▿params  $(typeof(▿params))")
+    #println("train_step xxxxx $(typeof(xxxxx))")
+    opt_state = Optimisers.update!(opt_state, m, loss)
 
     log = Dict(
         "positive_sample_loss" => positive_sample_loss,
         "negative_sample_loss" => negative_sample_loss,
         "loss" => loss,
     )
-    return r_state, r_model, log
+    return opt_state, ps, log
 end
 
 function test_step(model, easy_answers, hard_answers, args, test_dataloader,

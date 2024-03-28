@@ -105,7 +105,7 @@ function Base.getindex(data::TrainDataset, idx)
     positive_sample = convert.(Int, answers)
     #@info "tail $(tail)"
     #@info "positive_sample: $(positive_sample)"
-    return positive_sample, negative_sample, subsampling_weight, flatten(query), query_structure
+    return copy(positive_sample), copy(negative_sample), copy(subsampling_weight), flatten(query), query_structure
 end
 
 #Authors of custom data containers should implement Base.getindex for their type instead of getobs.

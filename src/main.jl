@@ -5,9 +5,12 @@ using Random
 using ArgParse
 using LoggingExtras, TensorBoardLogger
 using Dates
-using Flux, JLD2
-
-#println("working directory: {$(pwd())}")
+using Lux
+using LuxCUDA
+using Optimisers
+using CUDA
+using JLD2
+using ComponentArrays
 
 include("dataloader.jl")
 include("model.jl")
@@ -238,7 +241,8 @@ function main(cmd_args)
     #global train_queries, train_answers, valid_queries, valid_hard_answers, valid_easy_answers, test_queries, test_hard_answers, test_easy_answers
     args = parse_cmdargs(cmd_args)
 
-    Random.seed!(args["seed"])
+    rng = Random.default_rng()
+    Random.seed!(rng, args["seed"])
     tasks = split(args["tasks"], ".")
     for task in tasks
         if 'n' in task && args["geo"] in ["box", "vec"]
@@ -271,16 +275,14 @@ function main(cmd_args)
         args["save_path"] = joinpath(args["save_path"], save_str, cur_time)
     end
 
-    if ! ispath(args["save_path"])
-        mkpath(args["save_path"])
-    end
+    mkpath(args["save_path"])
 
     set_logger(args)
     @info ("overwritting saving path: $(args["save_path"])")
     if ! args["train"] # if not training, then create tensorboard files in some tmp location
-        tblogger = TBLogger("./$(prefix)/unused-tb")
+        tblogger = TBLogger("./$(prefix)/unused-tb", tb_overwrite)
     else
-        tblogger = TBLogger(args["save_path"])
+        tblogger = TBLogger(args["save_path"], tb_overwrite)
     end
 
     nentity, nrelation = open(joinpath(args["data_path"], "stats.txt")) do f
@@ -294,9 +296,10 @@ function main(cmd_args)
     args["nentity"] = nentity
     args["nrelation"] = nrelation
 
-    @info(repeat("-------------------------------", 2))
+    @info(repeat("-----------------------", 2))
     @info("Geo: $(args["geo"])")
     @info("Data Path: $(args["data_path"])")
+    @info "Use CUDA: $(args["cuda"])"
     @info("nentity: $(nentity)")
     @info("nrelation: $(nrelation)")
     @info("max steps: $(args["max_steps"])")
@@ -308,6 +311,58 @@ function main(cmd_args)
     @info("box_mode = $(eval_tuple(args["box_mode"]))")
     @info("beta_mode: $(eval_tuple(args["beta_mode"]))")
 
+    use_cuda = false
+    @info ("main: CUDA functional $(CUDA.functional())")
+    if args["cuda"] && LuxCUDA.functional()
+        @info "main: configed to use CUDA."
+        use_cuda = true
+    end
+
+    model = KGReasoning(nentity,
+                        nrelation,
+                        args["hidden_dim"],
+                        args["gamma"],
+                        query_name_dict,
+                        args["geo"],
+                        eval_tuple(args["box_mode"]),
+                        eval_tuple(args["beta_mode"]),
+                        use_cuda)
+    model_debug = Lux.Experimental.@debug_mode model
+    if use_cuda
+        model = model |> gpu
+    end
+    if args["train"]
+        ps, st = Lux.setup(rng, model)
+        #ps = ps |> ComponentArray
+        warn_up_steps = floor(args["max_steps"] / 2)
+    end
+
+    local init_step, checkpoint, step, current_learning_rate, warn_up_steps
+    current_learning_rate = args["learning_rate"]
+    if args["checkpoint_path"] != nothing
+        @info("Loading checkpoint $(args["checkpoint_path"])...")
+        trained_state = JLD2.load(joinPath(args["checkpoint_path"], "checkpoint"))
+
+        init_step = trained_state["step"]
+        ps_trained = checkpoint["trained_ps"]
+        #model.load_state_dict(checkpoint["model_state_dict"])
+
+        if args["train"]
+            current_learning_rate = trained_state["current_learning_rate"]
+            warn_up_steps = trained_state["warn_up_steps"]
+            ps = ps_trained
+            #optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        end
+    else
+        @info("Ramdomly Initializing $(args["geo"]) Model...")
+        init_step = 0
+    end
+
+    # setup Optimisers
+    opt_rule = Optimisers.ADAM(current_learning_rate)
+    opt_state = Optimisers.setup(opt_rule, ps)
+
+    @info ("main: ps keys $(keys(ps))")
     @time begin
         train_queries, train_answers, valid_queries, valid_hard_answers, valid_easy_answers,
         test_queries, test_hard_answers, test_easy_answers = KGDataset.load_data(args, name_query_dict)
@@ -315,7 +370,7 @@ function main(cmd_args)
 
     local train_path_dataloader, train_other_dataloader
     if args["train"]
-        @info("Train required...")
+        @info("Training ...")
         train_path_queries = Dict{Any, Set}()
         train_other_queries = Dict{Any, Set}()
         query_path_list = ["1p", "2p", "3p"]
@@ -328,17 +383,21 @@ function main(cmd_args)
         end
 
         train_path_queries = flatten_query(train_path_queries)
-        @info "Flatten query length: $(length(train_path_queries)) typeof(query) $(typeof(train_path_queries))"
-
         train_path_dataset = KGDataset.TrainDataset(train_path_queries, train_answers, nentity, nrelation,
                                                     args["negative_sample_size"])
 
-        train_path_dataloader = MLUtils.DataLoader(train_path_dataset, batchsize = args["batch_size"], shuffle = false);
+        if use_cuda
+            train_path_queries = train_path_queries |> gpu
+        end
+        train_path_dataloader = MLUtils.DataLoader(train_path_dataset, batchsize = args["batch_size"], shuffle = false)
 
         if length(train_other_queries) > 0
             train_other_queries = flatten_query(train_other_queries)
             train_other_dataset = KGDataset.TrainDataset(train_other_queries, train_answers, nentity, nrelation,
                                                          args["negative_sample_size"])
+            if use_cuda
+                train_other_dataset = train_other_dataset |> gpu
+            end
             train_other_dataloader = MLUtils.DataLoader(train_other_dataset, batchsize=args["batch_size"], shuffle=true)
         else
             train_other_dataloader = nothing
@@ -347,7 +406,6 @@ function main(cmd_args)
 
     if args["valid"]
         @info("Validation required...")
-
         valid_all_queries = flatten_query(valid_queries)
         valid_dataloader = KGDataset.DataLoader(KGDataset.TestDataset(valid_all_queries, nentity, nrelation),
                                                 batchsize=args["test_batch_size"]);
@@ -355,59 +413,9 @@ function main(cmd_args)
 
     if args["test"]
         @info("Test requried...")
-
         test_queries = flatten_query(test_queries)
         test_dataloader = KGDataset.DataLoader(KGDataset.TestDataset(test_queries, nentity, nrelation),
                                                batchsize=args["test_batch_size"]);
-    end
-
-    conf = KGRConfig(nentity,
-                     nrelation,
-                     args["hidden_dim"],
-                     args["gamma"],
-                     query_name_dict,
-                     args["geo"],
-                     eval_tuple(args["box_mode"]),
-                     eval_tuple(args["beta_mode"]),
-                     args["cuda"] == "Yes")
-
-    model = KGModel.build_KGReasoning(conf)
-    @info("Model Parameter Configuration:")
-    for (lindex,layer) in enumerate(Flux.params(model)) #.named_parameters()
-        num_params = 0
-        for (pindex, pa) in enumerate(Flux.params(layer))
-            @info("Parameter layer$lindex-$pindex: $(size(pa))")
-            num_params += sum(length, Flux.params(layer))
-        end
-        @info("Parameter Number: $num_params")
-    end
-
-    if args["cuda"]
-        model = model.cuda()
-    end
-
-    local init_step, checkpoint, step, current_learning_rate, warn_up_steps
-    if args["train"]
-        current_learning_rate = args["learning_rate"]
-        opt_state = Flux.setup(Flux.Optimise.Adam(current_learning_rate), model)
-        warn_up_steps = floor(args["max_steps"] / 2)
-    end
-
-    if args["checkpoint_path"] != nothing
-        @info("Loading checkpoint $(args["checkpoint_path"])...")
-        checkpoint = Flux.loadmodel!(model, JLD2.load(joinPath(args["checkpoint_path"], "checkpoint"), "model_state"))
-        init_step = checkpoint["step"]
-        Flux.loadmodel!(model, checkpoint["model_state_dict"])
-        #model.load_state_dict(checkpoint["model_state_dict"])
-
-        if args["train"]
-            current_learning_rate = checkpoint["current_learning_rate"]
-            warn_up_steps = checkpoint["warn_up_steps"]
-            #optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        end
-    else
-        @info("Ramdomly Initializing $(args["geo"]) Model...")
-        init_step = 0
     end
 
     step = init_step
@@ -420,12 +428,12 @@ function main(cmd_args)
         path_data, path_next = iterate(train_path_dataloader)
         other_data, other_next = iterate(train_other_dataloader)
         for step in range(init_step, args["max_steps"])
-            @info("Training step: $(step).......................")
+            @info("Training step: .......................$(step)")
             if step == 2 * floor(args["max_steps"] / 3)
                 args["valid_steps"] *= 4
             end
 
-            r_state, r_model, log = KGModel.train_step(model, conf, opt_state, path_data, args, step)
+            opt_state, ps, log = KGModel.train_step(model, path_data, ps, st, opt_state)
             # data for next step
             path_data, path_next = iterate(train_path_dataloader, path_next)
             for metric in log
@@ -435,14 +443,14 @@ function main(cmd_args)
             end
 
             if train_other_dataloader != nothing
-                r_state, r_model, log = KGModel.train_step(model, conf, opt_state, other_data, args, step)
+                opt_state, ps, log = KGModel.train_step(model, other_data, ps, st, opt_state)
                 other_data, other_next = iterate(train_other_dataloader, other_next)
                 for metric in log
                     with_logger(tblogger) do
                         @info "Training: other_" * "$(metric)" log[metric] = step
                     end
                 end
-                r_state, r_model, log = KGModel.train_step(model, conf, opt_state, path_data, args, step)
+                opt_state, ps, log = KGModel.train_step(model, path_data, ps, st, opt_state)
                 path_data, path_next = iterate(train_path_dataloader, other_next)
             end
 
@@ -452,7 +460,7 @@ function main(cmd_args)
                 current_learning_rate = current_learning_rate / 5
                 @info("Training Step: Change learning_rate to $(current_learning_rate) at step $(step)")
 
-                opt_state = Flux.setup(Flux.Optimise.Adam(current_learning_rate), model)
+                opt_state = Optimisers.setup(Optimisers.Adam(current_learning_rate), ps)
                 warn_up_steps = warn_up_steps * 1.5
             end
 
@@ -464,11 +472,14 @@ function main(cmd_args)
                 )
                 println("main: save model at step $(step) to $(joinpath(args["save_path"], "checkpoint-$(step).jld2"))")
                 jldsave(joinpath(args["save_path"], "checkpoint-$(step).jld2"),
-                        model_state = Flux.state(model), opt = opt_state,
-                          variables = save_variable_list, params = args)
+                        opt = opt_state,
+                        #model_state = Lux.state(model), opt = opt_state,
+                        variables = save_variable_list,
+                        params = args,
+                        ps = ps)
             end
 
-            if step % args["valid_steps"] == 0 && step > 0
+            if step > 0 && step % args["valid_steps"] == 0 && step > 0
                 if args["valid"]
                     @info("Evaluating on Valid Dataset...")
                     valid_all_metrics = evaluate(model, valid_easy_answers, valid_hard_answers, args,
@@ -482,7 +493,7 @@ function main(cmd_args)
                 end
             end
 
-            if step % args["log_steps"] == 0
+            if step > 0 && step % args["log_steps"] == 0
                 metrics = Dict()
                 #println("main: $(training_logs)")
                 if(length(training_logs) > 0)
@@ -516,7 +527,8 @@ function main(cmd_args)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    args = Vector{String}(["--train", "--data_path", "dataset/FB15k-betae",
+    CUDA.@allowscalar(true)
+    args = Vector{String}(["--train", "--data_path", "dataset/FB15k-betae", "--cuda",
                            "-n", "128", "-b", "64", "-d", "128", "-g", "24","--learning_rate",
                            "0.0001", "--max_steps", "4501",
                            "--cpu", "1", "--geo", "beta", "--valid_steps", "150"])

@@ -1,0 +1,2 @@
+[LuxDeviceUtils]
+gpu_backend = "CUDA"
